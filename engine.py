@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 import threading
 from pathlib import Path
@@ -191,6 +192,7 @@ def stage_apply(task_id: object, *, workspace: Path | None = None, storage: Path
                 continue
             destination = original.resolve(strict=False)
             destination.parent.mkdir(parents=True, exist_ok=True)
+            mode_before = stat.S_IMODE(destination.stat().st_mode) if destination.exists() else None
             temporary_name = None
             try:
                 descriptor, temporary_name = tempfile.mkstemp(
@@ -198,6 +200,8 @@ def stage_apply(task_id: object, *, workspace: Path | None = None, storage: Path
                 )
                 os.close(descriptor)
                 shutil.copy2(scratch, temporary_name)
+                if mode_before is not None:
+                    os.chmod(temporary_name, mode_before)
                 os.replace(temporary_name, destination)
             except OSError:
                 if temporary_name is not None:

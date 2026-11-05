@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import stat
 import sys
 import tempfile
 import unittest
@@ -111,6 +112,17 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(result["errors"][0]["error"], "original file changed since it was staged")
         self.assertEqual(self.note.read_text(encoding="utf-8"), "USER EDIT\n")
         self.assertFalse(any(path.name.startswith(".stage-") for path in self.workspace.iterdir()))
+
+    def test_apply_keeps_the_original_file_mode(self):
+        self.note.chmod(0o755)
+        directive = engine.plan_redirect(
+            "note.txt", "write_file", "task", workspace=self.workspace, storage=self.storage,
+        )
+        Path(directive["args"]["path"]).write_text("NEW\n", encoding="utf-8")
+        result = engine.stage_apply("task", workspace=self.workspace, storage=self.storage)
+        self.assertEqual(result["applied"], ["note.txt"])
+        self.assertEqual(self.note.read_text(encoding="utf-8"), "NEW\n")
+        self.assertEqual(stat.S_IMODE(self.note.stat().st_mode), 0o755)
 
     def test_apply_with_nothing_pending_changes_nothing(self):
         result = engine.stage_apply("task", workspace=self.workspace, storage=self.storage)
