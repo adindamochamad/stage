@@ -73,6 +73,29 @@ class EngineTest(unittest.TestCase):
         self.assertIn("outside", directive["message"])
         self.assertFalse(outside.exists())
 
+    def test_apply_refuses_when_original_changes_after_staging(self):
+        directive = engine.plan_redirect(
+            "note.txt", "write_file", "task", workspace=self.workspace, storage=self.storage,
+        )
+        Path(directive["args"]["path"]).write_text("STAGED\n", encoding="utf-8")
+        self.note.write_text("USER EDIT\n", encoding="utf-8")
+        result = engine.stage_apply("task", workspace=self.workspace, storage=self.storage)
+        self.assertEqual(result["applied"], [])
+        self.assertEqual(result["errors"][0]["error"], "original file changed since it was staged")
+        self.assertEqual(self.note.read_text(encoding="utf-8"), "USER EDIT\n")
+        self.assertEqual(engine.stage_status("task", storage=self.storage)["pending"][0]["path"], "note.txt")
+
+    def test_apply_refuses_when_a_new_file_appears_after_staging(self):
+        directive = engine.plan_redirect(
+            "fresh.txt", "write_file", "task", workspace=self.workspace, storage=self.storage,
+        )
+        Path(directive["args"]["path"]).write_text("STAGED\n", encoding="utf-8")
+        fresh = self.workspace / "fresh.txt"
+        fresh.write_text("USER EDIT\n", encoding="utf-8")
+        result = engine.stage_apply("task", workspace=self.workspace, storage=self.storage)
+        self.assertEqual(result["applied"], [])
+        self.assertEqual(fresh.read_text(encoding="utf-8"), "USER EDIT\n")
+
     def test_apply_with_nothing_pending_changes_nothing(self):
         result = engine.stage_apply("task", workspace=self.workspace, storage=self.storage)
         self.assertEqual(result, {"applied": [], "errors": []})

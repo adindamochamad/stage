@@ -61,7 +61,7 @@ def register(ctx):
         toolset="stage",
         schema=_schema(
             "stage_apply",
-            "Copy every staged file in this task onto its original path. This is the only call that changes the originals.",
+            "Copy every staged file in this task onto its original path. Refuses a file whose bytes changed after staging. This is the only call that changes the originals.",
         ),
         handler=_apply,
         description="Apply staged file edits onto the original files.",

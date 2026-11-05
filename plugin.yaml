@@ -1,5 +1,5 @@
 name: stage
-version: "0.1.0"
+version: "0.1.1"
 description: "Stage Hermes write_file and patch calls in a scratch copy. Original files stay unchanged until stage_apply."
 author: Adinda
 license: MIT

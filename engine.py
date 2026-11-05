@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -68,6 +69,20 @@ def _save(path: Path, data: dict) -> None:
     os.replace(temporary, path)
 
 
+def _fingerprint(path: Path) -> str | None:
+    """SHA-256 of a file, or None when there is no file to protect."""
+    try:
+        if not path.is_file():
+            return None
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
 def _remember(data_root_path: Path, task_id: object, relative: str, original: Path, scratch: Path, tool_name: str) -> None:
     path = _journal_path(data_root_path, task_id)
     with _LOCK:
@@ -77,6 +92,7 @@ def _remember(data_root_path: Path, task_id: object, relative: str, original: Pa
             "original": str(original),
             "scratch": str(scratch),
             "tool": tool_name,
+            "original_sha256": _fingerprint(original),
         }
         _save(path, data)
 
@@ -158,6 +174,12 @@ def stage_apply(task_id: object, *, workspace: Path | None = None, storage: Path
                 continue
             if not scratch.is_file():
                 errors.append({"path": relative, "error": "scratch copy is missing"})
+                remaining[relative] = entry
+                continue
+            expected_present = "original_sha256" in entry
+            current = _fingerprint(original)
+            if not expected_present or current != entry.get("original_sha256"):
+                errors.append({"path": relative, "error": "original file changed since it was staged"})
                 remaining[relative] = entry
                 continue
             original.parent.mkdir(parents=True, exist_ok=True)

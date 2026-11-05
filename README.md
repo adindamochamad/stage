@@ -31,6 +31,7 @@ Hermes writes the scratch copy and the file on disk still has the old line. Then
 1. **Path outside the workspace.** A write to `/tmp` or another directory is blocked. The destination file is not created.
 2. **`patch` on a file that is not there.** The call is blocked. Nothing is created and nothing else changes.
 3. **`stage_apply` when nothing is staged.** The tool returns an empty `applied` list. Files on disk stay as they are.
+4. **`stage_apply` after the original changed.** The apply for that file is refused. The newer bytes stay, and the scratch copy stays pending.
 
 `terminal` is not staged. A shell redirect can still change a file directly.
 

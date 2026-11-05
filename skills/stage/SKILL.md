@@ -1,7 +1,7 @@
 ---
 name: stage
 description: "Use after write_file or patch, and when the user says to apply or discard. Those writes land in a scratch copy; the original file changes only on stage_apply."
-version: 0.1.0
+version: 0.1.1
 author: Adinda
 license: MIT
 platforms: [linux, macos, windows]
@@ -12,7 +12,7 @@ metadata:
 
 # stage
 
-`write_file` and `patch` do not change the original file while this plugin is on. Hermes writes a scratch copy. The original bytes stay until `stage_apply`.
+`write_file` and `patch` do not change the original file while this plugin is on. Hermes writes a scratch copy. The original bytes stay until `stage_apply`. If those bytes change after staging, `stage_apply` refuses that file and leaves the newer bytes in place.
 
 ## When this applies
 
