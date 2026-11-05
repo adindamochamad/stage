@@ -1,0 +1,13 @@
+name: stage
+version: "0.1.0"
+description: "Stage Hermes write_file and patch calls in a scratch copy. Original files stay unchanged until stage_apply."
+author: Adinda
+license: MIT
+requires_hermes: ">=0.22.7"
+provides_tools:
+  - stage_apply
+  - stage_discard
+  - stage_status
+provides_hooks:
+  - pre_tool_call
+  - transform_tool_result
