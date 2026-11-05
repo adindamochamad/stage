@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import threading
 from pathlib import Path
 
@@ -87,12 +88,17 @@ def _remember(data_root_path: Path, task_id: object, relative: str, original: Pa
     path = _journal_path(data_root_path, task_id)
     with _LOCK:
         data = _load(path)
+        prior = data["files"].get(relative)
+        fresh_hash = _fingerprint(original)
+        stored_hash = fresh_hash
+        if isinstance(prior, dict) and "original_sha256" in prior:
+            stored_hash = prior["original_sha256"]
         data["files"][relative] = {
             "relative": relative,
             "original": str(original),
             "scratch": str(scratch),
             "tool": tool_name,
-            "original_sha256": _fingerprint(original),
+            "original_sha256": stored_hash,
         }
         _save(path, data)
 
@@ -178,12 +184,30 @@ def stage_apply(task_id: object, *, workspace: Path | None = None, storage: Path
                 continue
             expected_present = "original_sha256" in entry
             current = _fingerprint(original)
-            if not expected_present or current != entry.get("original_sha256"):
+            expected = entry.get("original_sha256")
+            if not expected_present or current != expected:
                 errors.append({"path": relative, "error": "original file changed since it was staged"})
                 remaining[relative] = entry
                 continue
-            original.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(scratch, original.resolve(strict=False))
+            destination = original.resolve(strict=False)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary_name = None
+            try:
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=".stage-", suffix=".tmp", dir=destination.parent,
+                )
+                os.close(descriptor)
+                shutil.copy2(scratch, temporary_name)
+                os.replace(temporary_name, destination)
+            except OSError:
+                if temporary_name is not None:
+                    try:
+                        os.unlink(temporary_name)
+                    except OSError:
+                        pass
+                errors.append({"path": relative, "error": "could not apply the scratch copy"})
+                remaining[relative] = entry
+                continue
             scratch.unlink()
             applied.append(relative)
         if remaining:

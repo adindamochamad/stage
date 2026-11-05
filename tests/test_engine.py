@@ -96,6 +96,22 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(result["applied"], [])
         self.assertEqual(fresh.read_text(encoding="utf-8"), "USER EDIT\n")
 
+    def test_second_stage_keeps_the_first_hash(self):
+        first = engine.plan_redirect(
+            "note.txt", "write_file", "task", workspace=self.workspace, storage=self.storage,
+        )
+        Path(first["args"]["path"]).write_text("STAGED\n", encoding="utf-8")
+        self.note.write_text("USER EDIT\n", encoding="utf-8")
+        second = engine.plan_redirect(
+            "note.txt", "patch", "task", workspace=self.workspace, storage=self.storage,
+        )
+        Path(second["args"]["path"]).write_text("STAGED AGAIN\n", encoding="utf-8")
+        result = engine.stage_apply("task", workspace=self.workspace, storage=self.storage)
+        self.assertEqual(result["applied"], [])
+        self.assertEqual(result["errors"][0]["error"], "original file changed since it was staged")
+        self.assertEqual(self.note.read_text(encoding="utf-8"), "USER EDIT\n")
+        self.assertFalse(any(path.name.startswith(".stage-") for path in self.workspace.iterdir()))
+
     def test_apply_with_nothing_pending_changes_nothing(self):
         result = engine.stage_apply("task", workspace=self.workspace, storage=self.storage)
         self.assertEqual(result, {"applied": [], "errors": []})
