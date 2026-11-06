@@ -94,8 +94,8 @@ def _journal_path(data_root_path: Path, task_id: object) -> Path:
     return _session(data_root_path, task_id) / "journal.json"
 
 
-def _batch_path(data_root_path: Path, task_id: object) -> Path:
-    return _session(data_root_path, task_id) / "last_v4a_batch"
+def _batch_map_path(data_root_path: Path, task_id: object) -> Path:
+    return _session(data_root_path, task_id) / "v4a_batches.json"
 
 
 def _lock_path(data_root_path: Path, task_id: object) -> Path:
@@ -224,6 +224,15 @@ def _remember_unlocked(
     stored_hash = fresh_hash
     if isinstance(prior, dict) and "original_sha256" in prior:
         stored_hash = prior["original_sha256"]
+    prior_copy = None
+    if isinstance(prior, dict) and batch and prior.get("batch") != batch:
+        prior_copy = json.loads(json.dumps(prior))
+        prior_scratch = Path(prior.get("scratch", ""))
+        if prior_scratch.is_file():
+            backup = Path(str(prior_scratch) + ".prior")
+            if prior_scratch.resolve(strict=False) != backup.resolve(strict=False):
+                shutil.copy2(prior_scratch, backup)
+                prior_copy["scratch"] = str(backup)
     entry = {
         "relative": relative,
         "original": str(original),
@@ -235,6 +244,8 @@ def _remember_unlocked(
     }
     if batch:
         entry["batch"] = batch
+    if prior_copy is not None:
+        entry["prior"] = prior_copy
     data["files"][relative] = entry
     _save(path, data)
 
@@ -372,6 +383,7 @@ def plan_tool(
     *,
     workspace: Path | None = None,
     storage: Path | None = None,
+    tool_call_id: str = "",
 ) -> dict | None:
     payload = args if isinstance(args, dict) else {}
     if tool_name in COMMAND_TOOLS:
@@ -379,7 +391,9 @@ def plan_tool(
     if tool_name not in STAGED_TOOLS:
         return None
     if tool_name == "patch" and _is_v4a(payload):
-        return plan_v4a(payload, task_id, workspace=workspace, storage=storage)
+        return plan_v4a(
+            payload, task_id, workspace=workspace, storage=storage, tool_call_id=tool_call_id,
+        )
     return plan_redirect(
         payload.get("path"), tool_name, task_id, workspace=workspace, storage=storage,
     )
@@ -500,6 +514,7 @@ def plan_v4a(
     *,
     workspace: Path | None = None,
     storage: Path | None = None,
+    tool_call_id: str = "",
 ) -> dict | None:
     patch_text = args.get("patch")
     operations = _parse_v4a(patch_text if isinstance(patch_text, str) else "")
@@ -573,7 +588,7 @@ def plan_v4a(
                 rewritten.append("\n")
         rewritten.append(_V4A_END + "\n")
         if has_core_patch:
-            _write_last_batch(store, task_id, batch_id)
+            _bind_batch(store, task_id, batch_id, tool_call_id)
     patch_out = "".join(rewritten)
     if "*** Update File:" not in patch_out and "*** Add File:" not in patch_out:
         return {
@@ -670,26 +685,77 @@ def _is_committed(entry: dict) -> bool:
     return entry.get("committed", True) is not False
 
 
-def _write_last_batch(data_root_path: Path, task_id: object, batch_id: str) -> None:
-    path = _batch_path(data_root_path, task_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(batch_id + "\n", encoding="utf-8")
-
-
-def _read_last_batch(data_root_path: Path, task_id: object) -> str | None:
+def _load_batch_map(data_root_path: Path, task_id: object) -> dict:
+    path = _batch_map_path(data_root_path, task_id)
     try:
-        text = _batch_path(data_root_path, task_id).read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    return text or None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"calls": {}, "pending": []}
+    if not isinstance(data, dict):
+        return {"calls": {}, "pending": []}
+    calls = data.get("calls")
+    pending = data.get("pending")
+    if not isinstance(calls, dict):
+        calls = {}
+    if not isinstance(pending, list):
+        pending = []
+    return {"calls": calls, "pending": pending}
 
 
-def _clear_last_batch(data_root_path: Path, task_id: object) -> None:
-    path = _batch_path(data_root_path, task_id)
+def _save_batch_map(data_root_path: Path, task_id: object, data: dict) -> None:
+    path = _batch_map_path(data_root_path, task_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def _bind_batch(data_root_path: Path, task_id: object, batch_id: str, tool_call_id: object) -> None:
+    data = _load_batch_map(data_root_path, task_id)
+    if tool_call_id:
+        data["calls"][safe_task_id(tool_call_id)] = batch_id
+    if batch_id not in data["pending"]:
+        data["pending"].append(batch_id)
+    _save_batch_map(data_root_path, task_id, data)
+
+
+def _unbind_batch(data_root_path: Path, task_id: object, batch_id: str) -> None:
+    data = _load_batch_map(data_root_path, task_id)
+    data["pending"] = [item for item in data["pending"] if item != batch_id]
+    data["calls"] = {key: value for key, value in data["calls"].items() if value != batch_id}
+    if data["pending"] or data["calls"]:
+        _save_batch_map(data_root_path, task_id, data)
+        return
+    path = _batch_map_path(data_root_path, task_id)
     try:
         path.unlink()
     except OSError:
         pass
+
+
+def _resolve_batch(
+    data_root_path: Path,
+    task_id: object,
+    batch_id: str | None,
+    tool_call_id: object,
+) -> str | None:
+    data = _load_batch_map(data_root_path, task_id)
+    if tool_call_id:
+        mapped = data["calls"].get(safe_task_id(tool_call_id))
+        if mapped:
+            return mapped
+    if batch_id:
+        return batch_id
+    pending = data["pending"]
+    if len(pending) == 1:
+        return pending[0]
+    return None
+
+
+def _unlink_if_file(path: Path) -> None:
+    if path.is_file():
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def commit_v4a_batch(
@@ -697,23 +763,27 @@ def commit_v4a_batch(
     batch_id: str | None = None,
     *,
     storage: Path | None = None,
+    tool_call_id: str = "",
 ) -> dict:
     store = storage or data_root()
     with _session_lock(store, task_id):
-        marker = batch_id or _read_last_batch(store, task_id)
+        marker = _resolve_batch(store, task_id, batch_id, tool_call_id)
         if not marker:
             return {"committed": []}
         journal = _journal_path(store, task_id)
         data = _load(journal)
         committed: list[str] = []
         for relative, entry in data["files"].items():
-            if entry.get("batch") == marker:
-                entry["committed"] = True
-                committed.append(relative)
+            if entry.get("batch") != marker:
+                continue
+            entry["committed"] = True
+            prior = entry.pop("prior", None)
+            if isinstance(prior, dict):
+                _unlink_if_file(Path(prior.get("scratch", "")))
+            committed.append(relative)
         if committed:
             _save(journal, data)
-        if _read_last_batch(store, task_id) == marker:
-            _clear_last_batch(store, task_id)
+        _unbind_batch(store, task_id, marker)
     return {"committed": committed}
 
 
@@ -722,10 +792,11 @@ def drop_v4a_batch(
     batch_id: str | None = None,
     *,
     storage: Path | None = None,
+    tool_call_id: str = "",
 ) -> dict:
     store = storage or data_root()
     with _session_lock(store, task_id):
-        marker = batch_id or _read_last_batch(store, task_id)
+        marker = _resolve_batch(store, task_id, batch_id, tool_call_id)
         if not marker:
             return {"dropped": []}
         journal = _journal_path(store, task_id)
@@ -733,22 +804,23 @@ def drop_v4a_batch(
         remaining: dict = {}
         dropped: list[str] = []
         for relative, entry in data["files"].items():
-            if entry.get("batch") == marker:
-                scratch = Path(entry.get("scratch", ""))
-                if scratch.is_file():
-                    try:
-                        scratch.unlink()
-                    except OSError:
-                        pass
-                dropped.append(relative)
-            else:
+            if entry.get("batch") != marker:
                 remaining[relative] = entry
+                continue
+            current = Path(entry.get("scratch", ""))
+            prior = entry.get("prior")
+            if isinstance(prior, dict):
+                remaining[relative] = prior
+                if current.is_file() and str(current) != prior.get("scratch"):
+                    _unlink_if_file(current)
+            else:
+                _unlink_if_file(current)
+            dropped.append(relative)
         if remaining:
             _save(journal, {"files": remaining})
         elif journal.exists():
             journal.unlink()
-        if _read_last_batch(store, task_id) == marker:
-            _clear_last_batch(store, task_id)
+        _unbind_batch(store, task_id, marker)
     return {"dropped": dropped}
 
 
@@ -757,19 +829,42 @@ def settle_v4a_batch(
     *,
     failed: bool,
     storage: Path | None = None,
+    tool_call_id: str = "",
+    batch_id: str | None = None,
 ) -> dict:
     if failed:
-        return drop_v4a_batch(task_id, storage=storage)
-    return commit_v4a_batch(task_id, storage=storage)
+        return drop_v4a_batch(task_id, batch_id, storage=storage, tool_call_id=tool_call_id)
+    return commit_v4a_batch(task_id, batch_id, storage=storage, tool_call_id=tool_call_id)
 
 
-def result_looks_failed(result: object) -> bool:
-    if not isinstance(result, str):
+def patch_call_failed(status: object = "", error_type: object = "", result: object = None) -> bool:
+    if error_type:
+        return True
+    text = str(status or "").strip().lower()
+    if text in {"error", "blocked", "fail", "failed", "failure"}:
+        return True
+    if text in {"ok", "success", "succeeded", "complete", "completed"}:
         return False
-    lower = result.lower()
-    if re.search(r"\b0 errors?\b", lower):
-        return False
-    return bool(re.search(r"\b(error|failed|failure)\b", lower))
+    if isinstance(result, dict):
+        payload = result
+    elif isinstance(result, str):
+        try:
+            loaded = json.loads(result)
+        except ValueError:
+            loaded = None
+        payload = loaded if isinstance(loaded, dict) else None
+    else:
+        payload = None
+    if isinstance(payload, dict):
+        if payload.get("success") is True or payload.get("ok") is True:
+            return False
+        if payload.get("success") is False or payload.get("ok") is False:
+            return True
+        if payload.get("error"):
+            return True
+        if str(payload.get("status") or "").lower() in {"error", "failed", "fail"}:
+            return True
+    return False
 
 
 def stage_status(task_id: object, *, storage: Path | None = None) -> dict:
@@ -778,12 +873,11 @@ def stage_status(task_id: object, *, storage: Path | None = None) -> dict:
         data = _load(_journal_path(store, task_id))
     pending = []
     for relative, entry in sorted(data["files"].items()):
-        if not _is_committed(entry):
-            continue
         scratch = Path(entry.get("scratch", ""))
         original = Path(entry.get("original", ""))
         op = entry.get("op") or "write"
         added, removed, binary = _entry_counts(entry)
+        committed = _is_committed(entry)
         ready = original.is_file() if op == "delete" else scratch.is_file()
         size = 0
         if op == "delete" and original.is_file():
@@ -794,12 +888,13 @@ def stage_status(task_id: object, *, storage: Path | None = None) -> dict:
             "path": relative,
             "original": entry.get("original", ""),
             "bytes": size,
-            "ready": ready,
+            "ready": ready and committed,
             "op": op,
             "added": added,
             "removed": removed,
             "conflict": _entry_conflict(entry),
             "binary": binary,
+            "committed": committed,
         })
     return {"pending": pending}
 
@@ -834,14 +929,14 @@ def stage_diff(
     store = storage or data_root()
     with _session_lock(store, task_id):
         data = _load(_journal_path(store, task_id))
-    visible = {key: entry for key, entry in data["files"].items() if _is_committed(entry)}
-    selected, errors = _select_entries(visible, paths, root)
+    selected, errors = _select_entries(data["files"], paths, root)
     files = []
     for relative, entry in selected:
         files.append({
             "path": relative,
             "conflict": _entry_conflict(entry),
             "op": entry.get("op") or "write",
+            "committed": _is_committed(entry),
             "diff": _entry_diff(relative, entry),
         })
     return {"files": files, "errors": errors}
@@ -965,6 +1060,10 @@ def stage_apply(
                 remaining[relative] = entry
                 continue
             if not _is_committed(entry):
+                errors.append({
+                    "path": relative,
+                    "error": "scratch is waiting for the patch result and was not applied",
+                })
                 remaining[relative] = entry
                 continue
             original = Path(entry.get("original", ""))
@@ -1118,61 +1217,80 @@ def _code_mutates(code: str) -> bool:
     return any(pattern.search(code) for pattern in _CODE_WRITE)
 
 
-def _mask_quoted(command: str) -> str:
-    out: list[str] = []
-    i = 0
-    n = len(command)
-    while i < n:
-        ch = command[i]
-        if ch in {"'", '"'}:
-            quote = ch
-            out.append(" ")
-            i += 1
-            while i < n:
-                if quote == '"' and command[i] == "\\" and i + 1 < n:
-                    out.append(" ")
-                    out.append(" ")
-                    i += 2
-                    continue
-                if command[i] == quote:
-                    out.append(" ")
-                    i += 1
-                    break
-                out.append(" ")
-                i += 1
-            continue
-        out.append(ch)
-        i += 1
-    return "".join(out)
+def _read_shell_token(command: str, index: int) -> tuple[str | None, int]:
+    length = len(command)
+    while index < length and command[index] in " \t":
+        index += 1
+    if index >= length:
+        return None, index
+    quote = command[index]
+    if quote in {"'", '"'}:
+        index += 1
+        chars: list[str] = []
+        while index < length:
+            ch = command[index]
+            if quote == '"' and ch == "\\" and index + 1 < length:
+                chars.append(command[index + 1])
+                index += 2
+                continue
+            if ch == quote:
+                index += 1
+                break
+            chars.append(ch)
+            index += 1
+        return "".join(chars) or None, index
+    chars = []
+    while index < length and command[index] not in " \t;|&<>":
+        chars.append(command[index])
+        index += 1
+    return "".join(chars) or None, index
 
 
-def _redirect_destinations(masked: str) -> list[str | None]:
+def _redirect_destinations(command: str) -> list[str | None]:
     destinations: list[str | None] = []
     i = 0
-    length = len(masked)
+    length = len(command)
+    in_single = False
+    in_double = False
     while i < length:
-        if masked[i] != ">":
+        ch = command[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
             i += 1
             continue
-        end = i + 2 if i + 1 < length and masked[i + 1] == ">" else i + 1
-        prev = masked[i - 1] if i else ""
-        nxt = masked[end] if end < length else ""
-        if prev in "-=~" or nxt in "&=":
+        if in_double:
+            if ch == "\\" and i + 1 < length:
+                i += 2
+                continue
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            i += 1
+            continue
+        if ch != ">":
+            i += 1
+            continue
+        end = i + 2 if i + 1 < length and command[i + 1] == ">" else i + 1
+        nxt = command[end] if end < length else ""
+        if nxt in "&=":
             i = end
             continue
-        rest = masked[end:].lstrip()
-        if not rest:
-            destinations.append(None)
-        else:
-            token = rest.split(None, 1)[0]
-            destinations.append(token)
-        i = end
+        dest, nxt_i = _read_shell_token(command, end)
+        destinations.append(dest)
+        i = nxt_i
     return destinations
 
 
 def _terminal_mutates(command: str, root: Path, workdir: str | None) -> bool:
-    masked = _mask_quoted(command)
-    for dest in _redirect_destinations(masked):
+    for dest in _redirect_destinations(command):
         if dest is None:
             return True
         if dest.startswith("&"):

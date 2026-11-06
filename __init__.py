@@ -10,8 +10,8 @@ from .engine import (
     STAGED_TOOLS,
     _is_v4a,
     parse_paths_parameter,
+    patch_call_failed,
     plan_tool,
-    result_looks_failed,
     settle_v4a_batch,
     stage_apply,
     stage_diff,
@@ -27,10 +27,10 @@ _SCRATCH_NOTE = (
 
 
 def register(ctx):
-    def before(tool_name, args=None, task_id="", **kwargs):
+    def before(tool_name, args=None, task_id="", tool_call_id="", **kwargs):
         del kwargs
         try:
-            return plan_tool(tool_name, args or {}, task_id)
+            return plan_tool(tool_name, args or {}, task_id, tool_call_id=tool_call_id)
         except Exception as exc:
             if tool_name in STAGED_TOOLS or tool_name in COMMAND_TOOLS:
                 return {
@@ -42,10 +42,13 @@ def register(ctx):
                 }
             return None
 
-    def rewrite_result(tool_name, args=None, result=None, task_id="", status="", error_type="", **kwargs):
+    def rewrite_result(tool_name, args=None, result=None, task_id="", status="", error_type="", tool_call_id="", **kwargs):
         del kwargs
         try:
-            _settle_patch(tool_name, args=args, result=result, status=status, error_type=error_type, task_id=task_id)
+            _settle_patch(
+                tool_name, args=args, result=result, status=status, error_type=error_type,
+                task_id=task_id, tool_call_id=tool_call_id,
+            )
             if tool_name not in STAGED_TOOLS or not isinstance(result, str):
                 return None
             if "scratch copy only" in result:
@@ -56,10 +59,13 @@ def register(ctx):
         except Exception:
             return None
 
-    def after_tool(tool_name, args=None, result=None, task_id="", status="", error_type="", **kwargs):
+    def after_tool(tool_name, args=None, result=None, task_id="", status="", error_type="", tool_call_id="", **kwargs):
         del kwargs
         try:
-            _settle_patch(tool_name, args=args, result=result, status=status, error_type=error_type, task_id=task_id)
+            _settle_patch(
+                tool_name, args=args, result=result, status=status, error_type=error_type,
+                task_id=task_id, tool_call_id=tool_call_id,
+            )
         except Exception:
             return None
         return None
@@ -133,18 +139,14 @@ def register(ctx):
     ctx.register_skill("stage", skill, description=_SKILL_DESCRIPTION)
 
 
-def _settle_patch(tool_name, args=None, result=None, status="", error_type="", task_id=""):
+def _settle_patch(tool_name, args=None, result=None, status="", error_type="", task_id="", tool_call_id=""):
     payload = args if isinstance(args, dict) else {}
     if tool_name != "patch":
         return
     if payload and not _is_v4a(payload):
         return
-    failed = str(status or "").lower() in {"error", "blocked", "fail", "failed"}
-    if error_type:
-        failed = True
-    if not failed:
-        failed = result_looks_failed(result)
-    settle_v4a_batch(task_id, failed=failed)
+    failed = patch_call_failed(status, error_type, result)
+    settle_v4a_batch(task_id, failed=failed, tool_call_id=tool_call_id)
 
 
 def _paths_or_error(args, *, empty_result: dict):

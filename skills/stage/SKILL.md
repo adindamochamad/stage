@@ -1,7 +1,7 @@
 ---
 name: stage
 description: "Use after write_file or patch, and when the user says to apply or discard. Those writes land in a scratch copy; the original file changes only on stage_apply."
-version: 0.2.2
+version: 0.2.3
 author: Adinda
 license: MIT
 platforms: [linux, macos, windows]
@@ -28,7 +28,7 @@ Say that the edit is staged and the original file is unchanged. Call `stage_diff
 
 ## Commands
 
-- `stage_status` lists pending files with added/removed line counts and conflict flags.
+- `stage_status` lists pending files with added/removed line counts, conflict flags, and `committed`. Entries waiting for a patch result have `committed: false`; do not apply those yet.
 - `stage_diff` shows the unified diff for pending files. Pass `paths` to limit the list.
 - `stage_apply` copies the scratch onto the original paths. Pass `paths` to apply a subset. This is the step that changes disk. A successful apply returns a receipt with before and after SHA-256 hashes.
 - `stage_discard` deletes the scratch. Pass `paths` to discard a subset. Originals stay as they were.
