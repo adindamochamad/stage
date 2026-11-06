@@ -14,13 +14,13 @@ _SCRATCH_NOTE = (
 
 
 def register(ctx):
-    def before(tool_name, args=None, task_id="", **kwargs):
+    def before(tool_name, args=None, task_id="", task_context=None, **kwargs):
         del kwargs
         if tool_name not in STAGED_TOOLS:
             return None
         try:
             payload = args or {}
-            return plan_redirect(payload.get("path"), tool_name, task_id)
+            return plan_redirect(payload.get("path"), tool_name, task_id, task_context=task_context)
         except Exception as exc:
             return {
                 "action": "block",

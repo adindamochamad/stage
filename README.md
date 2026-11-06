@@ -40,6 +40,7 @@ Hermes writes the scratch copy and the file on disk still has the old line. Then
 - `read_file` reads the original file, not the scratch copy.
 - If apply reports that the original changed, call `stage_discard`. Staging the same path again does not refresh the protected hash.
 - A scratch journal written by 0.1.0 has no hash, so apply refuses it. Call `stage_discard` before a demo.
+- **V4A multi-file patch is not supported.** The plugin only stages single-file `write_file` and `patch` calls. V4A format patches that modify multiple files in one call are always blocked.
 
 ## What it touches
 
