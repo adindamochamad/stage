@@ -381,6 +381,29 @@ def _relative_to_root(raw_path: object, root: Path) -> str | None:
         return text or None
 
 
+def _pending_v4a_overlap_block(
+    journal_data: dict,
+    relative: str,
+    *,
+    batch_id: str | None = None,
+) -> dict | None:
+    existing = journal_data.get("files", {}).get(relative)
+    if (
+        isinstance(existing, dict)
+        and existing.get("committed") is False
+        and existing.get("batch")
+        and existing.get("batch") != batch_id
+    ):
+        return {
+            "action": "block",
+            "message": (
+                f"stage: {relative} masih punya V4A batch yang belum selesai; "
+                "tunggu hasilnya atau stage_discard path itu."
+            ),
+        }
+    return None
+
+
 def plan_tool(
     tool_name: str,
     args: dict | None,
@@ -450,6 +473,10 @@ def plan_redirect(
     scratch = scratch_root / relative
     if not _contained(scratch, scratch_root):
         return {"action": "block", "message": "stage: could not place a scratch copy. Nothing was written."}
+    with _session_lock(store, task_id):
+        blocked = _pending_v4a_overlap_block(_load(_journal_path(store, task_id)), relative)
+    if blocked:
+        return blocked
     scratch.parent.mkdir(parents=True, exist_ok=True)
     if tool_name == "patch" and not scratch.is_file():
         seeded = _seed_scratch_from_journal(store, task_id, relative, scratch)
@@ -575,21 +602,11 @@ def plan_v4a(
     with _session_lock(store, task_id):
         journal_data = _load(_journal_path(store, task_id))
         for item in prepared:
-            existing = journal_data["files"].get(item["relative"])
-            if (
-                isinstance(existing, dict)
-                and existing.get("committed") is False
-                and existing.get("batch")
-                and existing.get("batch") != batch_id
-            ):
-                path = item["relative"]
-                return {
-                    "action": "block",
-                    "message": (
-                        f"stage: {path} masih punya V4A batch yang belum selesai; "
-                        "tunggu hasilnya atau stage_discard path itu."
-                    ),
-                }
+            blocked = _pending_v4a_overlap_block(
+                journal_data, item["relative"], batch_id=batch_id,
+            )
+            if blocked:
+                return blocked
         for item in prepared:
             scratch: Path = item["scratch"]
             scratch.parent.mkdir(parents=True, exist_ok=True)

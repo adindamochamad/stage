@@ -633,6 +633,110 @@ class ReviewTest(unittest.TestCase):
         )
         self.assertEqual(after_drop["action"], "modify")
 
+    def test_regular_patch_blocked_while_v4a_pending(self):
+        patch_a = (
+            "*** Begin Patch\n"
+            "*** Update File: note.txt\n"
+            "@@\n"
+            "-OLD\n"
+            "+A\n"
+            "*** End Patch\n"
+        )
+        engine.plan_tool(
+            "patch", {"mode": "patch", "patch": patch_a}, "task",
+            workspace=self.workspace, storage=self.storage, tool_call_id="batch-a",
+        )
+        before = engine._load(engine._journal_path(self.storage, "task"))
+        blocked = engine.plan_redirect(
+            "note.txt", "patch", "task", workspace=self.workspace, storage=self.storage,
+        )
+        self.assertEqual(blocked["action"], "block")
+        self.assertIn("belum selesai", blocked["message"])
+        after = engine._load(engine._journal_path(self.storage, "task"))
+        self.assertEqual(after, before)
+        pending = engine.stage_status("task", storage=self.storage)["pending"]
+        self.assertEqual(pending[0]["path"], "note.txt")
+        self.assertFalse(pending[0]["committed"])
+        applied = engine.stage_apply("task", workspace=self.workspace, storage=self.storage)
+        self.assertEqual(applied["applied"], [])
+        self.assertTrue(
+            any("waiting for the patch result" in err["error"] for err in applied["errors"])
+        )
+
+    def test_write_file_blocked_while_v4a_pending(self):
+        patch_a = (
+            "*** Begin Patch\n"
+            "*** Update File: note.txt\n"
+            "@@\n"
+            "-OLD\n"
+            "+A\n"
+            "*** End Patch\n"
+        )
+        engine.plan_tool(
+            "patch", {"mode": "patch", "patch": patch_a}, "task",
+            workspace=self.workspace, storage=self.storage, tool_call_id="batch-a",
+        )
+        before = engine._load(engine._journal_path(self.storage, "task"))
+        blocked = engine.plan_redirect(
+            "note.txt", "write_file", "task", workspace=self.workspace, storage=self.storage,
+        )
+        self.assertEqual(blocked["action"], "block")
+        self.assertIn("belum selesai", blocked["message"])
+        after = engine._load(engine._journal_path(self.storage, "task"))
+        self.assertEqual(after, before)
+        pending = engine.stage_status("task", storage=self.storage)["pending"]
+        self.assertFalse(pending[0]["committed"])
+
+    def test_regular_patch_on_other_path_while_v4a_pending(self):
+        patch_a = (
+            "*** Begin Patch\n"
+            "*** Update File: note.txt\n"
+            "@@\n"
+            "-OLD\n"
+            "+A\n"
+            "*** End Patch\n"
+        )
+        engine.plan_tool(
+            "patch", {"mode": "patch", "patch": patch_a}, "task",
+            workspace=self.workspace, storage=self.storage, tool_call_id="batch-a",
+        )
+        allowed = engine.plan_redirect(
+            "other.txt", "patch", "task", workspace=self.workspace, storage=self.storage,
+        )
+        self.assertEqual(allowed["action"], "modify")
+        pending = {row["path"]: row for row in engine.stage_status("task", storage=self.storage)["pending"]}
+        self.assertFalse(pending["note.txt"]["committed"])
+        self.assertTrue(pending["other.txt"]["committed"])
+
+    def test_regular_patch_allowed_after_v4a_commit_or_drop(self):
+        patch_a = (
+            "*** Begin Patch\n"
+            "*** Update File: note.txt\n"
+            "@@\n"
+            "-OLD\n"
+            "+A\n"
+            "*** End Patch\n"
+        )
+        engine.plan_tool(
+            "patch", {"mode": "patch", "patch": patch_a}, "task",
+            workspace=self.workspace, storage=self.storage, tool_call_id="batch-a",
+        )
+        engine.commit_v4a_batch("task", storage=self.storage, tool_call_id="batch-a")
+        after_commit = engine.plan_redirect(
+            "note.txt", "patch", "task", workspace=self.workspace, storage=self.storage,
+        )
+        self.assertEqual(after_commit["action"], "modify")
+        engine.stage_discard("task", ["note.txt"], storage=self.storage)
+        engine.plan_tool(
+            "patch", {"mode": "patch", "patch": patch_a}, "task",
+            workspace=self.workspace, storage=self.storage, tool_call_id="batch-c",
+        )
+        engine.drop_v4a_batch("task", storage=self.storage, tool_call_id="batch-c")
+        after_drop = engine.plan_redirect(
+            "note.txt", "patch", "task", workspace=self.workspace, storage=self.storage,
+        )
+        self.assertEqual(after_drop["action"], "modify")
+
 
 if __name__ == "__main__":
     unittest.main()
