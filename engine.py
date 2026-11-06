@@ -41,6 +41,7 @@ _V4A_HEADERS = (
 _REDIRECT = re.compile(
     r"(?:^|[\s;|&])(?:\d*)(?:>>|>)(?!&|=|>)\s*\S"
 )
+_GLUED_REDIRECT = re.compile(r"[\w./~-]+(?:>>|>)[\w./~-]")
 _CODE_WRITE = (
     re.compile(r"""open\s*\([^)]*['"](?:w|a|x|r\+|w\+|a\+|wb|ab|xb|wt|at)"""),
     re.compile(r"""open\s*\([^)]*mode\s*=\s*['"](?:w|a|x)"""),
@@ -402,8 +403,12 @@ def plan_redirect(
     resolved = _resolve_in_workspace(raw_path, root)
 
     protection_error, is_hard_deny = _check_write_protection(str(resolved))
-    del is_hard_deny
     if protection_error:
+        if is_hard_deny:
+            return {
+                "action": "block",
+                "message": f"stage: write blocked by Hermes protections ({protection_error}). The original file was not changed.",
+            }
         return None
 
     if not _contained(resolved, root):
@@ -502,8 +507,17 @@ def plan_v4a(
     for operation in operations:
         resolved = _resolve_in_workspace(operation["path"], root)
         protection_error, is_hard_deny = _check_write_protection(str(resolved))
-        del is_hard_deny
-        if protection_error or not _contained(resolved, root) or resolved.is_dir():
+        if protection_error:
+            if is_hard_deny:
+                return {
+                    "action": "block",
+                    "message": "stage: that patch includes a path blocked by Hermes protections. Nothing was changed.",
+                }
+            return {
+                "action": "block",
+                "message": "stage: that patch includes a path that requires Hermes approval. Nothing was changed.",
+            }
+        if not _contained(resolved, root) or resolved.is_dir():
             return {
                 "action": "block",
                 "message": "stage: that patch includes a path that cannot be staged. Nothing was changed.",
@@ -546,7 +560,15 @@ def plan_v4a(
             if body and not body.endswith("\n"):
                 rewritten.append("\n")
         rewritten.append(_V4A_END + "\n")
-    return {"action": "modify", "args": {"patch": "".join(rewritten)}}
+    patch_out = "".join(rewritten)
+    if "*** Update File:" not in patch_out and "*** Add File:" not in patch_out:
+        return {
+            "action": "block",
+            "message": (
+                "stage: deletion is staged. Original files are unchanged until stage_apply."
+            ),
+        }
+    return {"action": "modify", "args": {"patch": patch_out}}
 
 
 def _line_counts(before: str, after: str) -> tuple[int, int]:
@@ -660,6 +682,23 @@ def stage_status(task_id: object, *, storage: Path | None = None) -> dict:
     return {"pending": pending}
 
 
+def parse_paths_parameter(args: object) -> tuple[list[str] | None, str | None]:
+    """Return (paths, error). ``None`` paths means all pending files; ``[]`` means none."""
+    if not isinstance(args, dict) or "paths" not in args:
+        return None, None
+    raw = args["paths"]
+    if not isinstance(raw, list):
+        return None, "stage: paths must be an array of workspace-relative strings."
+    if not raw:
+        return [], None
+    cleaned: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            return None, "stage: paths must be an array of workspace-relative strings."
+        cleaned.append(item)
+    return cleaned, None
+
+
 def stage_diff(
     task_id: object,
     paths: list | None = None,
@@ -667,6 +706,8 @@ def stage_diff(
     workspace: Path | None = None,
     storage: Path | None = None,
 ) -> dict:
+    if paths is not None and len(paths) == 0:
+        return {"files": [], "errors": []}
     root = (workspace or workspace_root()).resolve()
     store = storage or data_root()
     with _session_lock(store, task_id):
@@ -684,8 +725,10 @@ def stage_diff(
 
 
 def _select_entries(files: dict, paths: list | None, root: Path) -> tuple[list[tuple[str, dict]], list[dict]]:
-    if not paths:
+    if paths is None:
         return [(relative, files[relative]) for relative in sorted(files)], []
+    if len(paths) == 0:
+        return [], []
     selected: list[tuple[str, dict]] = []
     errors: list[dict] = []
     seen: set[str] = set()
@@ -784,11 +827,13 @@ def stage_apply(
     store = storage or data_root()
     journal = _journal_path(store, task_id)
     scratch_root = _scratch_root(store, task_id)
+    if paths is not None and len(paths) == 0:
+        return {"applied": [], "errors": [], "receipts": []}
     receipts: list[dict] = []
     with _session_lock(store, task_id):
         data = _load(journal)
         selected, errors = _select_entries(data["files"], paths, root)
-        filtering = bool(paths)
+        filtering = paths is not None
         selected_keys = {relative for relative, _entry in selected}
         applied: list[str] = []
         remaining: dict = {}
@@ -871,10 +916,12 @@ def stage_discard(
     journal = _journal_path(store, task_id)
     session = _session(store, task_id)
     clear_session = False
+    if paths is not None and len(paths) == 0:
+        return {"discarded": [], "errors": []}
     with _session_lock(store, task_id):
         data = _load(journal)
         selected, errors = _select_entries(data["files"], paths, root)
-        if not paths:
+        if paths is None:
             discarded = sorted(data["files"])
             clear_session = True
         else:
@@ -892,8 +939,8 @@ def stage_discard(
                 _save(journal, {"files": remaining})
             else:
                 clear_session = True
-    if clear_session and session.exists():
-        shutil.rmtree(session, ignore_errors=True)
+        if clear_session and session.exists():
+            shutil.rmtree(session, ignore_errors=True)
     return {"discarded": discarded, "errors": errors}
 
 
@@ -946,7 +993,7 @@ def _code_mutates(code: str) -> bool:
 
 
 def _terminal_mutates(command: str, root: Path, workdir: str | None) -> bool:
-    if _REDIRECT.search(command):
+    if _REDIRECT.search(command) or _GLUED_REDIRECT.search(command):
         return True
     if re.search(r"\btee\b", command) or re.search(r"\btruncate\b", command):
         return True
@@ -983,7 +1030,7 @@ def _mutating_tokens(chunk: str, root: Path, workdir: str | None) -> bool:
         targets = [token for token in tokens[1:] if not token.startswith("-")]
         if len(targets) < 2:
             return True
-        return _target_in_workspace_or_unknown(targets[-1], root, workdir)
+        return any(_target_in_workspace_or_unknown(token, root, workdir) for token in targets)
     return False
 
 

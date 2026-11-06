@@ -143,6 +143,14 @@ class ReviewTest(unittest.TestCase):
         self.assertEqual(applied["applied"], ["note.txt"])
         self.assertEqual(self.note.read_text(encoding="utf-8"), "NEW\n")
 
+    def test_empty_paths_does_not_apply_everything(self):
+        self._write("note.txt", "NOTE\n")
+        result = engine.stage_apply(
+            "task", [], workspace=self.workspace, storage=self.storage,
+        )
+        self.assertEqual(result["applied"], [])
+        self.assertEqual(self.note.read_text(encoding="utf-8"), "OLD\n")
+
     def test_v4a_delete_does_not_remove_original_until_apply(self):
         patch = (
             "*** Begin Patch\n"
@@ -156,8 +164,8 @@ class ReviewTest(unittest.TestCase):
             workspace=self.workspace,
             storage=self.storage,
         )
-        self.assertEqual(directive["action"], "modify")
-        self.assertNotIn("Delete File: note.txt", directive["args"]["patch"])
+        self.assertEqual(directive["action"], "block")
+        self.assertIn("deletion is staged", directive["message"])
         self.assertTrue(self.note.is_file())
         status = engine.stage_status("task", storage=self.storage)
         self.assertEqual(status["pending"][0]["op"], "delete")
@@ -200,8 +208,10 @@ class ReviewTest(unittest.TestCase):
             "truncate -s 0 note.txt",
             "echo hi > note.txt",
             "echo hi >> note.txt",
+            "echo NEW>note.txt",
             "rm note.txt",
             "mv note.txt gone.txt",
+            "mv note.txt /tmp/x",
             "cp note.txt copy.txt",
             "git apply changes.patch",
             "git checkout note.txt",

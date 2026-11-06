@@ -29,17 +29,15 @@ class ProtectionTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_plan_redirect_returns_none_for_hard_deny_paths(self):
-        """plan_redirect should return None for paths Hermes would hard-deny."""
-        
+    def test_plan_redirect_blocks_hard_deny_paths(self):
+        """Hard-denied paths must not pass through to Hermes."""
+
         def mock_check_write_protection(path: str) -> tuple[str | None, bool]:
-            # Simulate Hermes denying ~/.ssh/authorized_keys (hard deny)
             if "authorized_keys" in path or ".ssh/authorized_keys" in path:
                 return ("Write denied: protected system/credential file", True)
             return (None, False)
-        
+
         with patch.object(engine, "_check_write_protection", side_effect=mock_check_write_protection):
-            # Protected path should return None (not staged, let core handle)
             result = engine.plan_redirect(
                 "~/.ssh/authorized_keys",
                 "write_file",
@@ -47,9 +45,9 @@ class ProtectionTest(unittest.TestCase):
                 workspace=self.workspace,
                 storage=self.storage,
             )
-            self.assertIsNone(result)
-            
-            # Normal path should be staged
+            self.assertEqual(result["action"], "block")
+            self.assertIn("Hermes protections", result["message"])
+
             result = engine.plan_redirect(
                 "note.txt",
                 "write_file",
@@ -193,7 +191,6 @@ class ProtectionTest(unittest.TestCase):
             return ("Error checking write protections: test failure", True)
         
         with patch.object(engine, "_check_write_protection", side_effect=mock_check_returns_error):
-            # Should return None (not staged) when protection check fails
             result = engine.plan_redirect(
                 "note.txt",
                 "write_file",
@@ -201,7 +198,7 @@ class ProtectionTest(unittest.TestCase):
                 workspace=self.workspace,
                 storage=self.storage,
             )
-            self.assertIsNone(result)
+            self.assertEqual(result["action"], "block")
     
     def test_instruction_file_backstop_catches_agents_md(self):
         """Built-in backstop catches AGENTS.md even when Hermes checks unavailable."""

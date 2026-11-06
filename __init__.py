@@ -8,6 +8,7 @@ from pathlib import Path
 from .engine import (
     COMMAND_TOOLS,
     STAGED_TOOLS,
+    parse_paths_parameter,
     plan_tool,
     stage_apply,
     stage_diff,
@@ -45,12 +46,9 @@ def register(ctx):
                 return None
             if "scratch copy only" in result:
                 return None
-            pending = stage_status(task_id).get("pending") or []
-            if not pending and "plugin-data/stage/sessions/" not in result:
+            if "plugin-data/stage/sessions/" not in result:
                 return None
-            if pending or "plugin-data/stage/sessions/" in result:
-                return result + _SCRATCH_NOTE
-            return None
+            return result + _SCRATCH_NOTE
         except Exception:
             return None
 
@@ -122,13 +120,13 @@ def register(ctx):
     ctx.register_skill("stage", skill, description=_SKILL_DESCRIPTION)
 
 
-def _paths(args) -> list | None:
-    if not isinstance(args, dict):
-        return None
-    paths = args.get("paths")
-    if not isinstance(paths, list):
-        return None
-    return [path for path in paths if isinstance(path, str)]
+def _paths_or_error(args, *, empty_result: dict):
+    paths, error = parse_paths_parameter(args)
+    if error:
+        payload = dict(empty_result)
+        payload["errors"] = [{"path": "", "error": error}]
+        return None, json.dumps(payload)
+    return paths, None
 
 
 def _status(args, task_id="", **kwargs):
@@ -138,17 +136,26 @@ def _status(args, task_id="", **kwargs):
 
 def _diff(args, task_id="", **kwargs):
     del kwargs
-    return json.dumps(stage_diff(task_id, _paths(args)))
+    paths, payload = _paths_or_error(args, empty_result={"files": [], "errors": []})
+    if payload is not None:
+        return payload
+    return json.dumps(stage_diff(task_id, paths))
 
 
 def _apply(args, task_id="", **kwargs):
     del kwargs
-    return json.dumps(stage_apply(task_id, _paths(args)))
+    paths, payload = _paths_or_error(args, empty_result={"applied": [], "errors": [], "receipts": []})
+    if payload is not None:
+        return payload
+    return json.dumps(stage_apply(task_id, paths))
 
 
 def _discard(args, task_id="", **kwargs):
     del kwargs
-    return json.dumps(stage_discard(task_id, _paths(args)))
+    paths, payload = _paths_or_error(args, empty_result={"discarded": [], "errors": []})
+    if payload is not None:
+        return payload
+    return json.dumps(stage_discard(task_id, paths))
 
 
 def _receipts(args, task_id="", **kwargs):
@@ -177,7 +184,7 @@ def _paths_schema(name: str, description: str) -> dict:
                 "paths": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Workspace-relative paths. Omit to include every pending file.",
+                    "description": "Workspace-relative paths. Omit to include every pending file. An empty array does nothing.",
                 },
             },
             "required": [],
