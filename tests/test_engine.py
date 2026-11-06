@@ -82,7 +82,9 @@ class EngineTest(unittest.TestCase):
         self.note.write_text("USER EDIT\n", encoding="utf-8")
         result = engine.stage_apply("task", workspace=self.workspace, storage=self.storage)
         self.assertEqual(result["applied"], [])
-        self.assertEqual(result["errors"][0]["error"], "original file changed since it was staged")
+        self.assertIn("original file changed since it was staged", result["errors"][0]["error"])
+        self.assertIn("stage_diff", result["errors"][0]["error"])
+        self.assertIn("stage_discard", result["errors"][0]["error"])
         self.assertEqual(self.note.read_text(encoding="utf-8"), "USER EDIT\n")
         self.assertEqual(engine.stage_status("task", storage=self.storage)["pending"][0]["path"], "note.txt")
 
@@ -109,7 +111,8 @@ class EngineTest(unittest.TestCase):
         Path(second["args"]["path"]).write_text("STAGED AGAIN\n", encoding="utf-8")
         result = engine.stage_apply("task", workspace=self.workspace, storage=self.storage)
         self.assertEqual(result["applied"], [])
-        self.assertEqual(result["errors"][0]["error"], "original file changed since it was staged")
+        self.assertIn("original file changed since it was staged", result["errors"][0]["error"])
+        self.assertIn("stage_diff", result["errors"][0]["error"])
         self.assertEqual(self.note.read_text(encoding="utf-8"), "USER EDIT\n")
         self.assertFalse(any(path.name.startswith(".stage-") for path in self.workspace.iterdir()))
 
@@ -126,7 +129,7 @@ class EngineTest(unittest.TestCase):
 
     def test_apply_with_nothing_pending_changes_nothing(self):
         result = engine.stage_apply("task", workspace=self.workspace, storage=self.storage)
-        self.assertEqual(result, {"applied": [], "errors": []})
+        self.assertEqual(result, {"applied": [], "errors": [], "receipts": []})
         self.assertEqual(self.note.read_text(encoding="utf-8"), "OLD\n")
 
     def test_other_tools_are_ignored(self):

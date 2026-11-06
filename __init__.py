@@ -5,43 +5,52 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .engine import STAGED_TOOLS, plan_redirect, stage_apply, stage_discard, stage_status
+from .engine import (
+    COMMAND_TOOLS,
+    STAGED_TOOLS,
+    plan_tool,
+    stage_apply,
+    stage_diff,
+    stage_discard,
+    stage_receipts,
+    stage_status,
+)
 
 _SCRATCH_NOTE = (
     "\nstage: scratch copy only. The original file is unchanged until stage_apply. "
-    "Call stage_status, then stage_apply or stage_discard."
+    "Call stage_diff, then stage_apply or stage_discard."
 )
 
 
 def register(ctx):
     def before(tool_name, args=None, task_id="", **kwargs):
-        # Real Hermes kwargs: tool_name, args, task_id, session_id, tool_call_id, 
-        # turn_id, api_request_id, middleware_trace
         del kwargs
-        if tool_name not in STAGED_TOOLS:
-            return None
         try:
-            payload = args or {}
-            return plan_redirect(payload.get("path"), tool_name, task_id)
+            return plan_tool(tool_name, args or {}, task_id)
         except Exception as exc:
-            return {
-                "action": "block",
-                "message": (
-                    "stage: could not stage this write "
-                    f"({type(exc).__name__}). The original file was not changed."
-                ),
-            }
+            if tool_name in STAGED_TOOLS or tool_name in COMMAND_TOOLS:
+                return {
+                    "action": "block",
+                    "message": (
+                        "stage: could not stage this write "
+                        f"({type(exc).__name__}). The original file was not changed."
+                    ),
+                }
+            return None
 
-    def rewrite_result(tool_name, result=None, **kwargs):
+    def rewrite_result(tool_name, result=None, task_id="", **kwargs):
         del kwargs
         try:
             if tool_name not in STAGED_TOOLS or not isinstance(result, str):
                 return None
-            if "plugin-data/stage/sessions/" not in result:
-                return None
             if "scratch copy only" in result:
                 return None
-            return result + _SCRATCH_NOTE
+            pending = stage_status(task_id).get("pending") or []
+            if not pending and "plugin-data/stage/sessions/" not in result:
+                return None
+            if pending or "plugin-data/stage/sessions/" in result:
+                return result + _SCRATCH_NOTE
+            return None
         except Exception:
             return None
 
@@ -59,11 +68,21 @@ def register(ctx):
         description="List staged file edits that have not been applied.",
     )
     ctx.register_tool(
+        name="stage_diff",
+        toolset="stage",
+        schema=_paths_schema(
+            "stage_diff",
+            "Show the unified diff between each original file and its scratch copy. Originals are unchanged.",
+        ),
+        handler=_diff,
+        description="Show staged diffs without changing original files.",
+    )
+    ctx.register_tool(
         name="stage_apply",
         toolset="stage",
-        schema=_schema(
+        schema=_paths_schema(
             "stage_apply",
-            "Copy every staged file in this task onto its original path. Refuses a file whose bytes changed after staging. This is the only call that changes the originals.",
+            "Copy staged files onto their original paths. Optional paths applies a subset. Refuses a file whose bytes changed after staging. This is the only call that changes the originals.",
         ),
         handler=_apply,
         description="Apply staged file edits onto the original files.",
@@ -71,16 +90,45 @@ def register(ctx):
     ctx.register_tool(
         name="stage_discard",
         toolset="stage",
-        schema=_schema(
+        schema=_paths_schema(
             "stage_discard",
-            "Delete the scratch copies for this task. Original files stay as they are.",
+            "Delete scratch copies. Optional paths discards a subset. Original files stay as they are.",
         ),
         handler=_discard,
         description="Throw away staged file edits.",
     )
+    ctx.register_tool(
+        name="stage_receipts",
+        toolset="stage",
+        schema={
+            "name": "stage_receipts",
+            "description": "List recent apply receipts with before and after SHA-256 hashes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many recent receipts to return. Default 10.",
+                    },
+                },
+                "required": [],
+            },
+        },
+        handler=_receipts,
+        description="List recent stage_apply receipts.",
+    )
 
     skill = Path(__file__).parent / "skills" / "stage" / "SKILL.md"
     ctx.register_skill("stage", skill, description=_SKILL_DESCRIPTION)
+
+
+def _paths(args) -> list | None:
+    if not isinstance(args, dict):
+        return None
+    paths = args.get("paths")
+    if not isinstance(paths, list):
+        return None
+    return [path for path in paths if isinstance(path, str)]
 
 
 def _status(args, task_id="", **kwargs):
@@ -88,14 +136,27 @@ def _status(args, task_id="", **kwargs):
     return json.dumps(stage_status(task_id))
 
 
+def _diff(args, task_id="", **kwargs):
+    del kwargs
+    return json.dumps(stage_diff(task_id, _paths(args)))
+
+
 def _apply(args, task_id="", **kwargs):
-    del args, kwargs
-    return json.dumps(stage_apply(task_id))
+    del kwargs
+    return json.dumps(stage_apply(task_id, _paths(args)))
 
 
 def _discard(args, task_id="", **kwargs):
-    del args, kwargs
-    return json.dumps(stage_discard(task_id))
+    del kwargs
+    return json.dumps(stage_discard(task_id, _paths(args)))
+
+
+def _receipts(args, task_id="", **kwargs):
+    del task_id, kwargs
+    limit = 10
+    if isinstance(args, dict) and isinstance(args.get("limit"), int):
+        limit = args["limit"]
+    return json.dumps(stage_receipts(limit))
 
 
 def _schema(name: str, description: str) -> dict:
@@ -106,7 +167,26 @@ def _schema(name: str, description: str) -> dict:
     }
 
 
+def _paths_schema(name: str, description: str) -> dict:
+    return {
+        "name": name,
+        "description": description,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Workspace-relative paths. Omit to include every pending file.",
+                },
+            },
+            "required": [],
+        },
+    }
+
+
 _SKILL_DESCRIPTION = (
     "Use after write_file or patch, and when the user says to apply or discard. "
-    "Those writes land in a scratch copy; the original file changes only on stage_apply."
+    "Those writes land in a scratch copy; the original file changes only on stage_apply. "
+    "Call stage_diff before apply."
 )

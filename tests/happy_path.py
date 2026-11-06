@@ -58,9 +58,16 @@ def main() -> int:
         return 1
 
     _call("write_file", {"path": "note.txt", "content": "APPLIED\n"}, "happy")
-    applied = _load(_call("stage_apply", {}, "happy"))
+    diff = _load(_call("stage_diff", {}, "happy"))
+    if not diff["files"] or "APPLIED" not in diff["files"][0].get("diff", ""):
+        print("FAIL diff", diff)
+        return 1
+    applied = _load(_call("stage_apply", {"paths": ["note.txt"]}, "happy"))
     if applied["applied"] != ["note.txt"] or NOTE.read_text(encoding="utf-8") != "APPLIED\n":
         print("FAIL apply", applied, NOTE.read_text(encoding="utf-8"))
+        return 1
+    if not applied.get("receipts") or not applied["receipts"][0].get("after_sha256"):
+        print("FAIL receipt", applied)
         return 1
 
     patched = _call(
