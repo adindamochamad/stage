@@ -202,6 +202,111 @@ class ProtectionTest(unittest.TestCase):
                 storage=self.storage,
             )
             self.assertIsNone(result)
+    
+    def test_instruction_file_backstop_catches_agents_md(self):
+        """Built-in backstop catches AGENTS.md even when Hermes checks unavailable."""
+        
+        # Test the backstop directly
+        self.assertTrue(engine._is_protected_instruction_backstop("AGENTS.md"))
+        self.assertTrue(engine._is_protected_instruction_backstop("agents.md"))  # case insensitive
+        self.assertTrue(engine._is_protected_instruction_backstop("/path/to/AGENTS.md"))
+        self.assertTrue(engine._is_protected_instruction_backstop("CLAUDE.md"))
+        self.assertTrue(engine._is_protected_instruction_backstop("SOUL.md"))
+        self.assertTrue(engine._is_protected_instruction_backstop(".cursorrules"))
+        self.assertTrue(engine._is_protected_instruction_backstop(".hermes/config.yaml"))
+        self.assertFalse(engine._is_protected_instruction_backstop("normal.txt"))
+    
+    def test_instruction_file_import_failure_fails_closed_in_hermes(self):
+        """Import failure for instruction file checks fails closed when in Hermes."""
+        
+        # Simulate being in Hermes context
+        sys.modules["agent"] = ModuleType("agent")
+        
+        try:
+            # Mock agent.file_safety but not tools.file_tools_write_guards
+            mock_file_safety = ModuleType("file_safety")
+            mock_file_safety.get_write_denied_error = lambda p: None
+            mock_file_safety.is_write_approval_required = lambda p: False
+            sys.modules["agent.file_safety"] = mock_file_safety
+            
+            # AGENTS.md should be caught by backstop and return error
+            error, is_hard_deny = engine._check_write_protection("AGENTS.md")
+            self.assertIsNotNone(error)
+            self.assertIn("protected instruction file", error.lower())
+            
+            # If backstop doesn't match and import failed: fail closed
+            error, is_hard_deny = engine._check_write_protection("some_file.txt")
+            self.assertIsNotNone(error)
+            self.assertIn("cannot verify", error.lower())
+            self.assertTrue(is_hard_deny)
+        finally:
+            sys.modules.pop("agent", None)
+            sys.modules.pop("agent.file_safety", None)
+    
+    def test_instruction_file_call_raises_fails_closed_in_hermes(self):
+        """Exception in instruction file check fails closed when in Hermes."""
+        
+        # Simulate being in Hermes context  
+        sys.modules["agent"] = ModuleType("agent")
+        
+        try:
+            # Mock agent.file_safety
+            mock_file_safety = ModuleType("file_safety")
+            mock_file_safety.get_write_denied_error = lambda p: None
+            mock_file_safety.is_write_approval_required = lambda p: False
+            sys.modules["agent.file_safety"] = mock_file_safety
+            
+            # Mock tools module that raises
+            mock_tools = ModuleType("tools")
+            mock_guards = ModuleType("file_tools_write_guards")
+            def raises_error(path, **kwargs):
+                raise RuntimeError("Deep dependency missing")
+            mock_guards._protected_instruction_reason = raises_error
+            mock_tools.file_tools_write_guards = mock_guards
+            sys.modules["tools"] = mock_tools
+            sys.modules["tools.file_tools_write_guards"] = mock_guards
+            
+            # Should fail closed on exception
+            error, is_hard_deny = engine._check_write_protection("some_file.txt")
+            self.assertIsNotNone(error)
+            self.assertIn("error checking", error.lower())
+            self.assertTrue(is_hard_deny)
+        finally:
+            sys.modules.pop("agent", None)
+            sys.modules.pop("agent.file_safety", None)
+            sys.modules.pop("tools", None)
+            sys.modules.pop("tools.file_tools_write_guards", None)
+    
+    def test_instruction_file_renamed_function_fails_closed_in_hermes(self):
+        """Renamed private function fails closed when in Hermes."""
+        
+        # Simulate being in Hermes context
+        sys.modules["agent"] = ModuleType("agent")
+        
+        try:
+            # Mock agent.file_safety
+            mock_file_safety = ModuleType("file_safety")
+            mock_file_safety.get_write_denied_error = lambda p: None
+            mock_file_safety.is_write_approval_required = lambda p: False
+            sys.modules["agent.file_safety"] = mock_file_safety
+            
+            # Mock tools module without the expected function
+            mock_tools = ModuleType("tools")
+            mock_guards = ModuleType("file_tools_write_guards")
+            # Function is renamed/missing
+            sys.modules["tools"] = mock_tools
+            sys.modules["tools.file_tools_write_guards"] = mock_guards
+            
+            # Should fail closed (attribute error on missing function)
+            error, is_hard_deny = engine._check_write_protection("some_file.txt")
+            self.assertIsNotNone(error)
+            # Either caught by import check or backstop fail-closed
+            self.assertTrue(is_hard_deny or "protected instruction" in error.lower())
+        finally:
+            sys.modules.pop("agent", None)
+            sys.modules.pop("agent.file_safety", None)
+            sys.modules.pop("tools", None)
+            sys.modules.pop("tools.file_tools_write_guards", None)
 
 
 if __name__ == "__main__":

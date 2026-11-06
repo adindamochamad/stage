@@ -118,6 +118,45 @@ def _remember(data_root_path: Path, task_id: object, relative: str, original: Pa
         _save(path, data)
 
 
+# Built-in protected instruction file basenames from Hermes source
+# (tools/file_tools_write_guards.py:192-193)
+# Used as fail-closed backstop when Hermes checks unavailable
+_PROTECTED_INSTRUCTION_BASENAMES = frozenset({
+    "agents.md", "claude.md", "soul.md", ".cursorrules"
+})
+
+
+def _is_protected_instruction_backstop(path: str) -> bool:
+    """Conservative built-in check for protected instruction files.
+    
+    Matches basenames case-insensitively per Hermes behavior.
+    Used as fail-closed backstop when tools.file_tools_write_guards unavailable.
+    """
+    try:
+        import os
+        from pathlib import Path
+        
+        # Check both normalized and resolved paths (per Hermes symlink handling)
+        candidates = [os.path.normpath(os.path.expanduser(path))]
+        try:
+            candidates.append(str(Path(path).expanduser().resolve()))
+        except Exception:
+            pass
+        
+        for candidate in candidates:
+            basename = os.path.basename(candidate).lower()
+            if basename in _PROTECTED_INSTRUCTION_BASENAMES:
+                return True
+            # Check for .hermes/config.yaml pattern (project-local config)
+            parts = candidate.replace("\\", "/").rstrip("/").split("/")
+            if len(parts) >= 2 and parts[-2] == ".hermes":
+                return True
+        return False
+    except Exception:
+        # Fail closed: can't determine, assume protected
+        return True
+
+
 def _check_write_protection(path: str) -> tuple[str | None, bool]:
     """Check if path would be denied or gated by Hermes write protections.
     
@@ -125,9 +164,18 @@ def _check_write_protection(path: str) -> tuple[str | None, bool]:
     - error_message: None if allowed, string if denied/gated
     - is_hard_deny: True if hard-denied, False if approval-gated
     
-    Fail closed: if checks raise or can't import, refuse the write.
-    Only allows fallback for test-only environments (no agent module).
+    Fail closed: when running inside Hermes (agent module present), ANY import
+    or call failure in ANY protection check must fail closed. Only allows
+    test-only fallback when agent module truly absent.
     """
+    # Detect if we're in a Hermes context
+    in_hermes = False
+    try:
+        import sys
+        in_hermes = 'agent' in sys.modules or 'plugins' in sys.modules
+    except Exception:
+        pass
+    
     try:
         from agent.file_safety import get_write_denied_error, is_write_approval_required
         
@@ -140,31 +188,49 @@ def _check_write_protection(path: str) -> tuple[str | None, bool]:
         if is_write_approval_required(path):
             return (f"Write to {path} requires approval", False)
         
-        # Check protected instruction files
+        # Check protected instruction files - fail closed on ANY error
         try:
             from tools.file_tools_write_guards import _protected_instruction_reason
-            if _protected_instruction_reason(path):
-                return (f"Write to protected instruction file {path} requires approval", False)
-        except ImportError:
-            # OK if file_tools_write_guards not available - covered by other checks
-            pass
+            reason = _protected_instruction_reason(path)
+            if reason:
+                return (f"Write to protected instruction file requires approval", False)
+        except ImportError as e:
+            # ImportError when running in Hermes: fail closed
+            if in_hermes:
+                # Use built-in backstop
+                if _is_protected_instruction_backstop(path):
+                    return (f"Write to protected instruction file requires approval (backstop)", False)
+                # If backstop doesn't match but import failed in Hermes: fail closed
+                return (f"Cannot verify instruction file protections: {e}", True)
+            # Not in Hermes (test environment): backstop check only
+            if _is_protected_instruction_backstop(path):
+                return (f"Write to protected instruction file requires approval (backstop)", False)
+        except Exception as e:
+            # ANY exception in protection check when in Hermes: fail closed
+            if in_hermes:
+                return (f"Error checking instruction file protections: {e}", True)
+            # Test environment: use backstop
+            if _is_protected_instruction_backstop(path):
+                return (f"Write to protected instruction file requires approval (backstop)", False)
         
         return (None, False)
     except ImportError:
-        # Test environment without agent module - allow for unit tests only
-        # Real Hermes installs always have agent.file_safety
-        try:
-            # Double-check we're really in a test-only env
-            import sys
-            if 'agent' not in sys.modules and 'plugins' not in sys.modules:
-                return (None, False)
-        except Exception:
-            pass
-        # Fail closed: if we can't verify protections in a real Hermes, refuse
-        return ("Cannot verify write protections (agent.file_safety unavailable)", True)
+        # agent.file_safety not available
+        if in_hermes:
+            # We're in Hermes but can't import protections: fail closed
+            return ("Cannot verify write protections (agent.file_safety unavailable in Hermes)", True)
+        # Test environment: allow, but still check instruction file backstop
+        if _is_protected_instruction_backstop(path):
+            return (f"Write to protected instruction file requires approval (backstop)", False)
+        return (None, False)
     except Exception as e:
-        # Fail closed: any error checking protections refuses the write
-        return (f"Error checking write protections: {e}", True)
+        # ANY exception checking protections: fail closed if in Hermes
+        if in_hermes:
+            return (f"Error checking write protections: {e}", True)
+        # Test environment: check backstop before allowing
+        if _is_protected_instruction_backstop(path):
+            return (f"Write to protected instruction file requires approval (backstop)", False)
+        return (None, False)
 
 
 def plan_redirect(
