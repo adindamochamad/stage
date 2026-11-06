@@ -14,13 +14,15 @@ _SCRATCH_NOTE = (
 
 
 def register(ctx):
-    def before(tool_name, args=None, task_id="", task_context=None, **kwargs):
+    def before(tool_name, args=None, task_id="", **kwargs):
+        # Real Hermes kwargs: tool_name, args, task_id, session_id, tool_call_id, 
+        # turn_id, api_request_id, middleware_trace
         del kwargs
         if tool_name not in STAGED_TOOLS:
             return None
         try:
             payload = args or {}
-            return plan_redirect(payload.get("path"), tool_name, task_id, task_context=task_context)
+            return plan_redirect(payload.get("path"), tool_name, task_id)
         except Exception as exc:
             return {
                 "action": "block",
