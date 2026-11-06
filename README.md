@@ -44,7 +44,7 @@ Hermes writes scratch copies. Both files on disk still have the old lines. Then:
 ## Known limits
 
 - MCP tools are not staged.
-- File deletion is staged only for V4A `Delete File` hunks. Other delete tools still change disk. A mixed V4A patch (delete plus add/update) is committed only after the Hermes patch succeeds; if that patch fails, the delete is dropped and any earlier staged edit of those paths is restored. Uncommitted patch batches appear in `stage_status` with `committed: false` and are not applied.
+- File deletion is staged only for V4A `Delete File` hunks. Other delete tools still change disk. A mixed V4A patch (delete plus add/update) is committed only after the Hermes patch succeeds; if that patch fails, the delete is dropped and any earlier staged edit of those paths is restored. Uncommitted patch batches appear in `stage_status` with `committed: false` and are not applied. A parallel V4A patch on the same path is rejected until the previous batch is committed or discarded.
 - `read_file` reads the original file, not the scratch copy.
 - A scratch journal written by 0.1.0 has no hash, so apply refuses it. Call `stage_discard` before a demo.
 - Shell commands that hide a write (`python -c`, `dd`) are not all caught.

@@ -301,6 +301,10 @@ class ReviewTest(unittest.TestCase):
             "ls >/dev/null",
             "cp note.txt /tmp/backup",
             "echo x 2>&1",
+            "cmd 2>&1",
+            "echo x >&1",
+            "echo x >&-",
+            "echo x >/dev/null",
         ]
         blocked = [
             "sed -i s/a/b/ note.txt",
@@ -317,6 +321,9 @@ class ReviewTest(unittest.TestCase):
             'echo x >"note.txt" /dev/null',
             "echo x >&note.txt",
             'echo x >"note".txt',
+            "echo x >1",
+            "echo x >-",
+            'echo x >"&1"',
             "rm note.txt",
             "mv note.txt gone.txt",
             "mv note.txt /tmp/x",
@@ -517,6 +524,114 @@ class ReviewTest(unittest.TestCase):
         self.assertEqual(sorted(applied["applied"]), ["note.txt", "note.txt.prior"])
         self.assertEqual(self.note.read_text(encoding="utf-8"), "STAGED\n")
         self.assertEqual(sibling.read_text(encoding="utf-8"), "KEEP PRIOR FILE\n")
+
+    def test_v4a_overlap_on_same_path_is_blocked(self):
+        patch_a = (
+            "*** Begin Patch\n"
+            "*** Update File: note.txt\n"
+            "@@\n"
+            "-OLD\n"
+            "+A\n"
+            "*** End Patch\n"
+        )
+        patch_b = (
+            "*** Begin Patch\n"
+            "*** Update File: note.txt\n"
+            "@@\n"
+            "-OLD\n"
+            "+B\n"
+            "*** End Patch\n"
+        )
+        engine.plan_tool(
+            "patch", {"mode": "patch", "patch": patch_a}, "task",
+            workspace=self.workspace, storage=self.storage, tool_call_id="batch-a",
+        )
+        before = engine._load(engine._journal_path(self.storage, "task"))
+        blocked = engine.plan_tool(
+            "patch", {"mode": "patch", "patch": patch_b}, "task",
+            workspace=self.workspace, storage=self.storage, tool_call_id="batch-b",
+        )
+        self.assertEqual(blocked["action"], "block")
+        self.assertIn("belum selesai", blocked["message"])
+        after = engine._load(engine._journal_path(self.storage, "task"))
+        self.assertEqual(after, before)
+        pending = engine.stage_status("task", storage=self.storage)["pending"]
+        self.assertEqual([row["path"] for row in pending], ["note.txt"])
+        self.assertFalse(pending[0]["committed"])
+
+    def test_v4a_overlap_on_other_path_is_allowed(self):
+        a_file = self.workspace / "a.txt"
+        b_file = self.workspace / "b.txt"
+        a_file.write_text("A0\n", encoding="utf-8")
+        b_file.write_text("B0\n", encoding="utf-8")
+        patch_a = (
+            "*** Begin Patch\n"
+            "*** Update File: a.txt\n"
+            "@@\n"
+            "-A0\n"
+            "+A1\n"
+            "*** End Patch\n"
+        )
+        patch_b = (
+            "*** Begin Patch\n"
+            "*** Update File: b.txt\n"
+            "@@\n"
+            "-B0\n"
+            "+B1\n"
+            "*** End Patch\n"
+        )
+        first = engine.plan_tool(
+            "patch", {"mode": "patch", "patch": patch_a}, "task",
+            workspace=self.workspace, storage=self.storage, tool_call_id="batch-a",
+        )
+        self.assertEqual(first["action"], "modify")
+        second = engine.plan_tool(
+            "patch", {"mode": "patch", "patch": patch_b}, "task",
+            workspace=self.workspace, storage=self.storage, tool_call_id="batch-b",
+        )
+        self.assertEqual(second["action"], "modify")
+        pending = {row["path"]: row for row in engine.stage_status("task", storage=self.storage)["pending"]}
+        self.assertFalse(pending["a.txt"]["committed"])
+        self.assertFalse(pending["b.txt"]["committed"])
+
+    def test_v4a_overlap_allowed_after_commit_or_drop(self):
+        patch_a = (
+            "*** Begin Patch\n"
+            "*** Update File: note.txt\n"
+            "@@\n"
+            "-OLD\n"
+            "+A\n"
+            "*** End Patch\n"
+        )
+        patch_b = (
+            "*** Begin Patch\n"
+            "*** Update File: note.txt\n"
+            "@@\n"
+            "-OLD\n"
+            "+B\n"
+            "*** End Patch\n"
+        )
+        engine.plan_tool(
+            "patch", {"mode": "patch", "patch": patch_a}, "task",
+            workspace=self.workspace, storage=self.storage, tool_call_id="batch-a",
+        )
+        engine.commit_v4a_batch("task", storage=self.storage, tool_call_id="batch-a")
+        after_commit = engine.plan_tool(
+            "patch", {"mode": "patch", "patch": patch_b}, "task",
+            workspace=self.workspace, storage=self.storage, tool_call_id="batch-b",
+        )
+        self.assertEqual(after_commit["action"], "modify")
+        engine.drop_v4a_batch("task", storage=self.storage, tool_call_id="batch-b")
+        engine.plan_tool(
+            "patch", {"mode": "patch", "patch": patch_a}, "task",
+            workspace=self.workspace, storage=self.storage, tool_call_id="batch-c",
+        )
+        engine.drop_v4a_batch("task", storage=self.storage, tool_call_id="batch-c")
+        after_drop = engine.plan_tool(
+            "patch", {"mode": "patch", "patch": patch_b}, "task",
+            workspace=self.workspace, storage=self.storage, tool_call_id="batch-d",
+        )
+        self.assertEqual(after_drop["action"], "modify")
 
 
 if __name__ == "__main__":

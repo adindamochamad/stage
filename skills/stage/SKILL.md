@@ -1,7 +1,7 @@
 ---
 name: stage
 description: "Use after write_file or patch, and when the user says to apply or discard. Those writes land in a scratch copy; the original file changes only on stage_apply."
-version: 0.2.4
+version: 0.2.5
 author: Adinda
 license: MIT
 platforms: [linux, macos, windows]

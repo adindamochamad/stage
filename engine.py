@@ -573,6 +573,23 @@ def plan_v4a(
     has_core_patch = any(item["op"] != "delete" for item in prepared)
     committed = not has_core_patch
     with _session_lock(store, task_id):
+        journal_data = _load(_journal_path(store, task_id))
+        for item in prepared:
+            existing = journal_data["files"].get(item["relative"])
+            if (
+                isinstance(existing, dict)
+                and existing.get("committed") is False
+                and existing.get("batch")
+                and existing.get("batch") != batch_id
+            ):
+                path = item["relative"]
+                return {
+                    "action": "block",
+                    "message": (
+                        f"stage: {path} masih punya V4A batch yang belum selesai; "
+                        "tunggu hasilnya atau stage_discard path itu."
+                    ),
+                }
         for item in prepared:
             scratch: Path = item["scratch"]
             scratch.parent.mkdir(parents=True, exist_ok=True)
@@ -1264,12 +1281,13 @@ def _read_quoted_span(command: str, index: int) -> tuple[str, int]:
     return "".join(chars), index
 
 
-def _read_shell_word(command: str, index: int) -> tuple[str | None, int]:
+def _read_shell_word(command: str, index: int) -> tuple[str | None, int, bool]:
     length = len(command)
     while index < length and command[index] in " \t":
         index += 1
     if index >= length:
-        return None, index
+        return None, index, False
+    quoted = command[index] in {"'", '"'}
     parts: list[str] = []
     while index < length:
         ch = command[index]
@@ -1283,7 +1301,7 @@ def _read_shell_word(command: str, index: int) -> tuple[str | None, int]:
         while index < length and command[index] not in " \t;|&<>'\"":
             index += 1
         parts.append(command[start:index])
-    return ("".join(parts) or None), index
+    return ("".join(parts) or None), index, quoted
 
 
 def _redirect_destinations(command: str) -> list[str | None]:
@@ -1315,23 +1333,46 @@ def _redirect_destinations(command: str) -> list[str | None]:
             in_double = True
             i += 1
             continue
+        if ch == "<":
+            if i + 1 < length and command[i + 1] == "&":
+                dest, nxt_i, _quoted = _read_shell_word(command, i + 2)
+                i = nxt_i if dest is not None else i + 2
+                continue
+            i += 1
+            continue
         if ch != ">":
             i += 1
             continue
-        end = i + 2 if i + 1 < length and command[i + 1] == ">" else i + 1
-        nxt = command[end] if end < length else ""
-        if nxt == "=":
-            i = end
-            continue
-        if nxt == "&":
-            dest, nxt_i = _read_shell_word(command, end + 1)
-            if dest is None or dest.isdigit() or dest == "-":
-                i = nxt_i if dest is not None else end + 1
-                continue
+        prev = command[i - 1] if i else ""
+        if prev == "&":
+            end = i + 2 if i + 1 < length and command[i + 1] == ">" else i + 1
+            dest, nxt_i, _quoted = _read_shell_word(command, end)
             destinations.append(dest)
             i = nxt_i
             continue
-        dest, nxt_i = _read_shell_word(command, end)
+        if i + 1 < length and command[i + 1] == ">":
+            dest, nxt_i, _quoted = _read_shell_word(command, i + 2)
+            destinations.append(dest)
+            i = nxt_i
+            continue
+        nxt = command[i + 1] if i + 1 < length else ""
+        if nxt == "=":
+            i += 1
+            continue
+        if nxt == "|":
+            dest, nxt_i, _quoted = _read_shell_word(command, i + 2)
+            destinations.append(dest)
+            i = nxt_i
+            continue
+        if nxt == "&":
+            dest, nxt_i, quoted = _read_shell_word(command, i + 2)
+            if dest is not None and not quoted and (dest.isdigit() or dest == "-"):
+                i = nxt_i
+                continue
+            destinations.append(dest)
+            i = nxt_i if dest is not None else i + 2
+            continue
+        dest, nxt_i, _quoted = _read_shell_word(command, i + 1)
         destinations.append(dest)
         i = nxt_i
     return destinations
@@ -1341,9 +1382,7 @@ def _terminal_mutates(command: str, root: Path, workdir: str | None) -> bool:
     for dest in _redirect_destinations(command):
         if dest is None:
             return True
-        if dest.isdigit() or dest in {"-", "/dev/null", "/dev/zero", "/dev/stderr", "/dev/stdout"}:
-            continue
-        if dest.startswith("&") and dest[1:].isdigit():
+        if dest in {"/dev/null", "/dev/zero", "/dev/stderr", "/dev/stdout"}:
             continue
         if _target_in_workspace_or_unknown(dest, root, workdir):
             return True
