@@ -98,6 +98,11 @@ def _batch_map_path(data_root_path: Path, task_id: object) -> Path:
     return _session(data_root_path, task_id) / "v4a_batches.json"
 
 
+def _prior_backup_path(data_root_path: Path, task_id: object, relative: str, batch_id: str) -> Path:
+    digest = hashlib.sha256(f"{relative}\0{batch_id}".encode("utf-8")).hexdigest()[:24]
+    return _session(data_root_path, task_id) / "priors" / f"{digest}.bak"
+
+
 def _lock_path(data_root_path: Path, task_id: object) -> Path:
     return _session(data_root_path, task_id) / "journal.lock"
 
@@ -229,10 +234,10 @@ def _remember_unlocked(
         prior_copy = json.loads(json.dumps(prior))
         prior_scratch = Path(prior.get("scratch", ""))
         if prior_scratch.is_file():
-            backup = Path(str(prior_scratch) + ".prior")
-            if prior_scratch.resolve(strict=False) != backup.resolve(strict=False):
-                shutil.copy2(prior_scratch, backup)
-                prior_copy["scratch"] = str(backup)
+            backup = _prior_backup_path(data_root_path, task_id, relative, batch)
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(prior_scratch, backup)
+            prior_copy["scratch"] = str(backup)
     entry = {
         "relative": relative,
         "original": str(original),
@@ -447,12 +452,14 @@ def plan_redirect(
         return {"action": "block", "message": "stage: could not place a scratch copy. Nothing was written."}
     scratch.parent.mkdir(parents=True, exist_ok=True)
     if tool_name == "patch" and not scratch.is_file():
-        if not resolved.is_file():
-            return {
-                "action": "block",
-                "message": "stage: patch needs an existing file. Nothing was changed.",
-            }
-        shutil.copy2(resolved, scratch)
+        seeded = _seed_scratch_from_journal(store, task_id, relative, scratch)
+        if not seeded:
+            if not resolved.is_file():
+                return {
+                    "action": "block",
+                    "message": "stage: patch needs an existing file. Nothing was changed.",
+                }
+            shutil.copy2(resolved, scratch)
     _remember(store, task_id, relative, resolved, scratch, tool_name)
     return {"action": "modify", "args": {"path": str(scratch)}}
 
@@ -571,7 +578,8 @@ def plan_v4a(
             scratch.parent.mkdir(parents=True, exist_ok=True)
             op = "delete" if item["op"] == "delete" else "write"
             if item["op"] == "update" and not scratch.is_file():
-                shutil.copy2(item["resolved"], scratch)
+                if not _seed_scratch_from_journal(store, task_id, item["relative"], scratch):
+                    shutil.copy2(item["resolved"], scratch)
             _remember_unlocked(
                 store, task_id, item["relative"], item["resolved"], scratch, "patch",
                 op=op, batch=batch_id, committed=committed,
@@ -739,14 +747,9 @@ def _resolve_batch(
 ) -> str | None:
     data = _load_batch_map(data_root_path, task_id)
     if tool_call_id:
-        mapped = data["calls"].get(safe_task_id(tool_call_id))
-        if mapped:
-            return mapped
+        return data["calls"].get(safe_task_id(tool_call_id))
     if batch_id:
         return batch_id
-    pending = data["pending"]
-    if len(pending) == 1:
-        return pending[0]
     return None
 
 
@@ -756,6 +759,24 @@ def _unlink_if_file(path: Path) -> None:
             path.unlink()
         except OSError:
             pass
+
+
+def _seed_scratch_from_journal(store: Path, task_id: object, relative: str, scratch: Path) -> bool:
+    data = _load(_journal_path(store, task_id))
+    prior = data["files"].get(relative)
+    if not isinstance(prior, dict):
+        return False
+    source = Path(prior.get("scratch", ""))
+    if not source.is_file():
+        nested = prior.get("prior")
+        if isinstance(nested, dict):
+            source = Path(nested.get("scratch", ""))
+    if not source.is_file():
+        return False
+    scratch.parent.mkdir(parents=True, exist_ok=True)
+    if source.resolve(strict=False) != scratch.resolve(strict=False):
+        shutil.copy2(source, scratch)
+    return True
 
 
 def commit_v4a_batch(
@@ -810,9 +831,16 @@ def drop_v4a_batch(
             current = Path(entry.get("scratch", ""))
             prior = entry.get("prior")
             if isinstance(prior, dict):
-                remaining[relative] = prior
-                if current.is_file() and str(current) != prior.get("scratch"):
-                    _unlink_if_file(current)
+                restored = dict(prior)
+                canonical = _scratch_root(store, task_id) / relative
+                backup = Path(restored.get("scratch", ""))
+                if backup.is_file():
+                    canonical.parent.mkdir(parents=True, exist_ok=True)
+                    if backup.resolve(strict=False) != canonical.resolve(strict=False):
+                        shutil.copy2(backup, canonical)
+                        _unlink_if_file(backup)
+                    restored["scratch"] = str(canonical)
+                remaining[relative] = restored
             else:
                 _unlink_if_file(current)
             dropped.append(relative)
@@ -1217,33 +1245,45 @@ def _code_mutates(code: str) -> bool:
     return any(pattern.search(code) for pattern in _CODE_WRITE)
 
 
-def _read_shell_token(command: str, index: int) -> tuple[str | None, int]:
+def _read_quoted_span(command: str, index: int) -> tuple[str, int]:
+    quote = command[index]
+    index += 1
+    chars: list[str] = []
+    length = len(command)
+    while index < length:
+        ch = command[index]
+        if quote == '"' and ch == "\\" and index + 1 < length:
+            chars.append(command[index + 1])
+            index += 2
+            continue
+        if ch == quote:
+            index += 1
+            break
+        chars.append(ch)
+        index += 1
+    return "".join(chars), index
+
+
+def _read_shell_word(command: str, index: int) -> tuple[str | None, int]:
     length = len(command)
     while index < length and command[index] in " \t":
         index += 1
     if index >= length:
         return None, index
-    quote = command[index]
-    if quote in {"'", '"'}:
-        index += 1
-        chars: list[str] = []
-        while index < length:
-            ch = command[index]
-            if quote == '"' and ch == "\\" and index + 1 < length:
-                chars.append(command[index + 1])
-                index += 2
-                continue
-            if ch == quote:
-                index += 1
-                break
-            chars.append(ch)
+    parts: list[str] = []
+    while index < length:
+        ch = command[index]
+        if ch in " \t;|&<>":
+            break
+        if ch in {"'", '"'}:
+            piece, index = _read_quoted_span(command, index)
+            parts.append(piece)
+            continue
+        start = index
+        while index < length and command[index] not in " \t;|&<>'\"":
             index += 1
-        return "".join(chars) or None, index
-    chars = []
-    while index < length and command[index] not in " \t;|&<>":
-        chars.append(command[index])
-        index += 1
-    return "".join(chars) or None, index
+        parts.append(command[start:index])
+    return ("".join(parts) or None), index
 
 
 def _redirect_destinations(command: str) -> list[str | None]:
@@ -1280,10 +1320,18 @@ def _redirect_destinations(command: str) -> list[str | None]:
             continue
         end = i + 2 if i + 1 < length and command[i + 1] == ">" else i + 1
         nxt = command[end] if end < length else ""
-        if nxt in "&=":
+        if nxt == "=":
             i = end
             continue
-        dest, nxt_i = _read_shell_token(command, end)
+        if nxt == "&":
+            dest, nxt_i = _read_shell_word(command, end + 1)
+            if dest is None or dest.isdigit() or dest == "-":
+                i = nxt_i if dest is not None else end + 1
+                continue
+            destinations.append(dest)
+            i = nxt_i
+            continue
+        dest, nxt_i = _read_shell_word(command, end)
         destinations.append(dest)
         i = nxt_i
     return destinations
@@ -1293,9 +1341,9 @@ def _terminal_mutates(command: str, root: Path, workdir: str | None) -> bool:
     for dest in _redirect_destinations(command):
         if dest is None:
             return True
-        if dest.startswith("&"):
+        if dest.isdigit() or dest in {"-", "/dev/null", "/dev/zero", "/dev/stderr", "/dev/stdout"}:
             continue
-        if dest in {"/dev/null", "/dev/zero", "/dev/stderr", "/dev/stdout"}:
+        if dest.startswith("&") and dest[1:].isdigit():
             continue
         if _target_in_workspace_or_unknown(dest, root, workdir):
             return True

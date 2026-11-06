@@ -128,6 +128,7 @@ class ReviewTest(unittest.TestCase):
             "task",
             workspace=self.workspace,
             storage=self.storage,
+            tool_call_id="upd",
         )
         self.assertEqual(directive["action"], "modify")
         rewritten = directive["args"]["patch"]
@@ -136,7 +137,7 @@ class ReviewTest(unittest.TestCase):
         pending = engine.stage_status("task", storage=self.storage)["pending"]
         self.assertEqual(pending[0]["path"], "note.txt")
         self.assertFalse(pending[0]["committed"])
-        engine.commit_v4a_batch("task", storage=self.storage)
+        engine.commit_v4a_batch("task", storage=self.storage, tool_call_id="upd")
         status = engine.stage_status("task", storage=self.storage)
         self.assertEqual(status["pending"][0]["path"], "note.txt")
         self.assertTrue(status["pending"][0]["committed"])
@@ -230,8 +231,9 @@ class ReviewTest(unittest.TestCase):
             "task",
             workspace=self.workspace,
             storage=self.storage,
+            tool_call_id="mix-drop",
         )
-        dropped = engine.drop_v4a_batch("task", storage=self.storage)
+        dropped = engine.drop_v4a_batch("task", storage=self.storage, tool_call_id="mix-drop")
         self.assertIn("gone.txt", dropped["dropped"])
         self.assertIn("note.txt", dropped["dropped"])
         self.assertTrue(gone.is_file())
@@ -259,12 +261,13 @@ class ReviewTest(unittest.TestCase):
             "task",
             workspace=self.workspace,
             storage=self.storage,
+            tool_call_id="mix-commit",
         )
         scratch = Path(
             engine._load(engine._journal_path(self.storage, "task"))["files"]["note.txt"]["scratch"]
         )
         scratch.write_text("NEW\n", encoding="utf-8")
-        engine.commit_v4a_batch("task", storage=self.storage)
+        engine.commit_v4a_batch("task", storage=self.storage, tool_call_id="mix-commit")
         applied = engine.stage_apply("task", workspace=self.workspace, storage=self.storage)
         self.assertEqual(sorted(applied["applied"]), ["gone.txt", "note.txt"])
         self.assertFalse(gone.exists())
@@ -297,6 +300,7 @@ class ReviewTest(unittest.TestCase):
             "grep 'a>b' README.md",
             "ls >/dev/null",
             "cp note.txt /tmp/backup",
+            "echo x 2>&1",
         ]
         blocked = [
             "sed -i s/a/b/ note.txt",
@@ -311,6 +315,8 @@ class ReviewTest(unittest.TestCase):
             ">note.txt",
             "echo x->note.txt",
             'echo x >"note.txt" /dev/null',
+            "echo x >&note.txt",
+            'echo x >"note".txt',
             "rm note.txt",
             "mv note.txt gone.txt",
             "mv note.txt /tmp/x",
@@ -388,6 +394,28 @@ class ReviewTest(unittest.TestCase):
         self.assertEqual(applied["applied"], ["note.txt"])
         self.assertEqual(self.note.read_text(encoding="utf-8"), "STAGED\n")
 
+    def test_rollback_then_next_patch_keeps_staged_bytes(self):
+        self._write("note.txt", "STAGED\n")
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: note.txt\n"
+            "@@\n"
+            "-OLD\n"
+            "+NEW\n"
+            "*** End Patch\n"
+        )
+        engine.plan_tool(
+            "patch", {"mode": "patch", "patch": patch}, "task",
+            workspace=self.workspace, storage=self.storage, tool_call_id="v4a-1",
+        )
+        engine.drop_v4a_batch("task", storage=self.storage, tool_call_id="v4a-1")
+        directive = engine.plan_redirect(
+            "note.txt", "patch", "task", workspace=self.workspace, storage=self.storage,
+        )
+        scratch = Path(directive["args"]["path"])
+        self.assertEqual(scratch.read_text(encoding="utf-8"), "STAGED\n")
+        self.assertEqual(self.note.read_text(encoding="utf-8"), "OLD\n")
+
     def test_two_v4a_batches_settle_by_tool_call_id(self):
         patch_note = (
             "*** Begin Patch\n"
@@ -414,6 +442,9 @@ class ReviewTest(unittest.TestCase):
             workspace=self.workspace, storage=self.storage, tool_call_id="call-b",
         )
         engine.drop_v4a_batch("task", storage=self.storage, tool_call_id="call-a")
+        engine.commit_v4a_batch("task", storage=self.storage, tool_call_id="call-a")
+        pending = {row["path"]: row for row in engine.stage_status("task", storage=self.storage)["pending"]}
+        self.assertFalse(pending["other.txt"]["committed"])
         engine.commit_v4a_batch("task", storage=self.storage, tool_call_id="call-b")
         pending = {row["path"]: row for row in engine.stage_status("task", storage=self.storage)["pending"]}
         self.assertNotIn("note.txt", pending)
@@ -432,6 +463,60 @@ class ReviewTest(unittest.TestCase):
         self.assertFalse(engine.patch_call_failed("ok", "", result))
         self.assertTrue(engine.patch_call_failed("error", "", result))
         self.assertFalse(engine.patch_call_failed("ok", "", 'success:true\nprint("error")'))
+
+    def test_second_callback_does_not_commit_other_batch(self):
+        patch_note = (
+            "*** Begin Patch\n"
+            "*** Update File: note.txt\n"
+            "@@\n"
+            "-OLD\n"
+            "+NOTE\n"
+            "*** End Patch\n"
+        )
+        patch_other = (
+            "*** Begin Patch\n"
+            "*** Update File: other.txt\n"
+            "@@\n"
+            "-KEEP\n"
+            "+OTHER\n"
+            "*** End Patch\n"
+        )
+        engine.plan_tool(
+            "patch", {"mode": "patch", "patch": patch_note}, "task",
+            workspace=self.workspace, storage=self.storage, tool_call_id="call-a",
+        )
+        engine.plan_tool(
+            "patch", {"mode": "patch", "patch": patch_other}, "task",
+            workspace=self.workspace, storage=self.storage, tool_call_id="call-b",
+        )
+        engine.commit_v4a_batch("task", storage=self.storage, tool_call_id="call-a")
+        engine.commit_v4a_batch("task", storage=self.storage, tool_call_id="call-a")
+        pending = {row["path"]: row for row in engine.stage_status("task", storage=self.storage)["pending"]}
+        self.assertTrue(pending["note.txt"]["committed"])
+        self.assertFalse(pending["other.txt"]["committed"])
+
+    def test_prior_backup_does_not_collide_with_workspace_name(self):
+        sibling = self.workspace / "note.txt.prior"
+        sibling.write_text("SIBLING\n", encoding="utf-8")
+        self._write("note.txt", "STAGED\n")
+        self._write("note.txt.prior", "KEEP PRIOR FILE\n")
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: note.txt\n"
+            "@@\n"
+            "-OLD\n"
+            "+NEW\n"
+            "*** End Patch\n"
+        )
+        engine.plan_tool(
+            "patch", {"mode": "patch", "patch": patch}, "task",
+            workspace=self.workspace, storage=self.storage, tool_call_id="collide",
+        )
+        engine.drop_v4a_batch("task", storage=self.storage, tool_call_id="collide")
+        applied = engine.stage_apply("task", workspace=self.workspace, storage=self.storage)
+        self.assertEqual(sorted(applied["applied"]), ["note.txt", "note.txt.prior"])
+        self.assertEqual(self.note.read_text(encoding="utf-8"), "STAGED\n")
+        self.assertEqual(sibling.read_text(encoding="utf-8"), "KEEP PRIOR FILE\n")
 
 
 if __name__ == "__main__":
