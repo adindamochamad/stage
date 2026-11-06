@@ -8,8 +8,11 @@ from pathlib import Path
 from .engine import (
     COMMAND_TOOLS,
     STAGED_TOOLS,
+    _is_v4a,
     parse_paths_parameter,
     plan_tool,
+    result_looks_failed,
+    settle_v4a_batch,
     stage_apply,
     stage_diff,
     stage_discard,
@@ -39,9 +42,10 @@ def register(ctx):
                 }
             return None
 
-    def rewrite_result(tool_name, result=None, task_id="", **kwargs):
+    def rewrite_result(tool_name, args=None, result=None, task_id="", status="", error_type="", **kwargs):
         del kwargs
         try:
+            _settle_patch(tool_name, args=args, result=result, status=status, error_type=error_type, task_id=task_id)
             if tool_name not in STAGED_TOOLS or not isinstance(result, str):
                 return None
             if "scratch copy only" in result:
@@ -52,7 +56,16 @@ def register(ctx):
         except Exception:
             return None
 
+    def after_tool(tool_name, args=None, result=None, task_id="", status="", error_type="", **kwargs):
+        del kwargs
+        try:
+            _settle_patch(tool_name, args=args, result=result, status=status, error_type=error_type, task_id=task_id)
+        except Exception:
+            return None
+        return None
+
     ctx.register_hook("pre_tool_call", before)
+    ctx.register_hook("post_tool_call", after_tool)
     ctx.register_hook("transform_tool_result", rewrite_result)
 
     ctx.register_tool(
@@ -118,6 +131,20 @@ def register(ctx):
 
     skill = Path(__file__).parent / "skills" / "stage" / "SKILL.md"
     ctx.register_skill("stage", skill, description=_SKILL_DESCRIPTION)
+
+
+def _settle_patch(tool_name, args=None, result=None, status="", error_type="", task_id=""):
+    payload = args if isinstance(args, dict) else {}
+    if tool_name != "patch":
+        return
+    if payload and not _is_v4a(payload):
+        return
+    failed = str(status or "").lower() in {"error", "blocked", "fail", "failed"}
+    if error_type:
+        failed = True
+    if not failed:
+        failed = result_looks_failed(result)
+    settle_v4a_batch(task_id, failed=failed)
 
 
 def _paths_or_error(args, *, empty_result: dict):

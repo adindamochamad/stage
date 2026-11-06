@@ -14,6 +14,7 @@ import shutil
 import stat
 import tempfile
 import threading
+import uuid
 from pathlib import Path
 
 STAGED_TOOLS = frozenset({"write_file", "patch"})
@@ -38,10 +39,6 @@ _V4A_HEADERS = (
     ("Add File", "add"),
     ("Delete File", "delete"),
 )
-_REDIRECT = re.compile(
-    r"(?:^|[\s;|&])(?:\d*)(?:>>|>)(?!&|=|>)\s*\S"
-)
-_GLUED_REDIRECT = re.compile(r"[\w./~-]+(?:>>|>)[\w./~-]")
 _CODE_WRITE = (
     re.compile(r"""open\s*\([^)]*['"](?:w|a|x|r\+|w\+|a\+|wb|ab|xb|wt|at)"""),
     re.compile(r"""open\s*\([^)]*mode\s*=\s*['"](?:w|a|x)"""),
@@ -95,6 +92,10 @@ def _scratch_root(data_root_path: Path, task_id: object) -> Path:
 
 def _journal_path(data_root_path: Path, task_id: object) -> Path:
     return _session(data_root_path, task_id) / "journal.json"
+
+
+def _batch_path(data_root_path: Path, task_id: object) -> Path:
+    return _session(data_root_path, task_id) / "last_v4a_batch"
 
 
 def _lock_path(data_root_path: Path, task_id: object) -> Path:
@@ -212,6 +213,9 @@ def _remember_unlocked(
     scratch: Path,
     tool_name: str,
     op: str = "write",
+    *,
+    batch: str | None = None,
+    committed: bool = True,
 ) -> None:
     path = _journal_path(data_root_path, task_id)
     data = _load(path)
@@ -220,14 +224,18 @@ def _remember_unlocked(
     stored_hash = fresh_hash
     if isinstance(prior, dict) and "original_sha256" in prior:
         stored_hash = prior["original_sha256"]
-    data["files"][relative] = {
+    entry = {
         "relative": relative,
         "original": str(original),
         "scratch": str(scratch),
         "tool": tool_name,
         "op": op,
         "original_sha256": stored_hash,
+        "committed": committed,
     }
+    if batch:
+        entry["batch"] = batch
+    data["files"][relative] = entry
     _save(path, data)
 
 
@@ -539,6 +547,9 @@ def plan_v4a(
         prepared.append({**operation, "resolved": resolved, "relative": relative, "scratch": scratch})
 
     rewritten: list[str] = [_V4A_BEGIN + "\n"]
+    batch_id = uuid.uuid4().hex
+    has_core_patch = any(item["op"] != "delete" for item in prepared)
+    committed = not has_core_patch
     with _session_lock(store, task_id):
         for item in prepared:
             scratch: Path = item["scratch"]
@@ -547,7 +558,8 @@ def plan_v4a(
             if item["op"] == "update" and not scratch.is_file():
                 shutil.copy2(item["resolved"], scratch)
             _remember_unlocked(
-                store, task_id, item["relative"], item["resolved"], scratch, "patch", op=op,
+                store, task_id, item["relative"], item["resolved"], scratch, "patch",
+                op=op, batch=batch_id, committed=committed,
             )
             if item["op"] == "delete":
                 continue
@@ -560,6 +572,8 @@ def plan_v4a(
             if body and not body.endswith("\n"):
                 rewritten.append("\n")
         rewritten.append(_V4A_END + "\n")
+        if has_core_patch:
+            _write_last_batch(store, task_id, batch_id)
     patch_out = "".join(rewritten)
     if "*** Update File:" not in patch_out and "*** Add File:" not in patch_out:
         return {
@@ -652,12 +666,120 @@ def _entry_diff(relative: str, entry: dict) -> str:
     return _unified(relative, before or "", after or "")
 
 
+def _is_committed(entry: dict) -> bool:
+    return entry.get("committed", True) is not False
+
+
+def _write_last_batch(data_root_path: Path, task_id: object, batch_id: str) -> None:
+    path = _batch_path(data_root_path, task_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(batch_id + "\n", encoding="utf-8")
+
+
+def _read_last_batch(data_root_path: Path, task_id: object) -> str | None:
+    try:
+        text = _batch_path(data_root_path, task_id).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return text or None
+
+
+def _clear_last_batch(data_root_path: Path, task_id: object) -> None:
+    path = _batch_path(data_root_path, task_id)
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def commit_v4a_batch(
+    task_id: object,
+    batch_id: str | None = None,
+    *,
+    storage: Path | None = None,
+) -> dict:
+    store = storage or data_root()
+    with _session_lock(store, task_id):
+        marker = batch_id or _read_last_batch(store, task_id)
+        if not marker:
+            return {"committed": []}
+        journal = _journal_path(store, task_id)
+        data = _load(journal)
+        committed: list[str] = []
+        for relative, entry in data["files"].items():
+            if entry.get("batch") == marker:
+                entry["committed"] = True
+                committed.append(relative)
+        if committed:
+            _save(journal, data)
+        if _read_last_batch(store, task_id) == marker:
+            _clear_last_batch(store, task_id)
+    return {"committed": committed}
+
+
+def drop_v4a_batch(
+    task_id: object,
+    batch_id: str | None = None,
+    *,
+    storage: Path | None = None,
+) -> dict:
+    store = storage or data_root()
+    with _session_lock(store, task_id):
+        marker = batch_id or _read_last_batch(store, task_id)
+        if not marker:
+            return {"dropped": []}
+        journal = _journal_path(store, task_id)
+        data = _load(journal)
+        remaining: dict = {}
+        dropped: list[str] = []
+        for relative, entry in data["files"].items():
+            if entry.get("batch") == marker:
+                scratch = Path(entry.get("scratch", ""))
+                if scratch.is_file():
+                    try:
+                        scratch.unlink()
+                    except OSError:
+                        pass
+                dropped.append(relative)
+            else:
+                remaining[relative] = entry
+        if remaining:
+            _save(journal, {"files": remaining})
+        elif journal.exists():
+            journal.unlink()
+        if _read_last_batch(store, task_id) == marker:
+            _clear_last_batch(store, task_id)
+    return {"dropped": dropped}
+
+
+def settle_v4a_batch(
+    task_id: object,
+    *,
+    failed: bool,
+    storage: Path | None = None,
+) -> dict:
+    if failed:
+        return drop_v4a_batch(task_id, storage=storage)
+    return commit_v4a_batch(task_id, storage=storage)
+
+
+def result_looks_failed(result: object) -> bool:
+    if not isinstance(result, str):
+        return False
+    lower = result.lower()
+    if re.search(r"\b0 errors?\b", lower):
+        return False
+    return bool(re.search(r"\b(error|failed|failure)\b", lower))
+
+
 def stage_status(task_id: object, *, storage: Path | None = None) -> dict:
     store = storage or data_root()
     with _session_lock(store, task_id):
         data = _load(_journal_path(store, task_id))
     pending = []
     for relative, entry in sorted(data["files"].items()):
+        if not _is_committed(entry):
+            continue
         scratch = Path(entry.get("scratch", ""))
         original = Path(entry.get("original", ""))
         op = entry.get("op") or "write"
@@ -712,7 +834,8 @@ def stage_diff(
     store = storage or data_root()
     with _session_lock(store, task_id):
         data = _load(_journal_path(store, task_id))
-    selected, errors = _select_entries(data["files"], paths, root)
+    visible = {key: entry for key, entry in data["files"].items() if _is_committed(entry)}
+    selected, errors = _select_entries(visible, paths, root)
     files = []
     for relative, entry in selected:
         files.append({
@@ -839,6 +962,9 @@ def stage_apply(
         remaining: dict = {}
         for relative, entry in data["files"].items():
             if filtering and relative not in selected_keys:
+                remaining[relative] = entry
+                continue
+            if not _is_committed(entry):
                 remaining[relative] = entry
                 continue
             original = Path(entry.get("original", ""))
@@ -992,9 +1118,69 @@ def _code_mutates(code: str) -> bool:
     return any(pattern.search(code) for pattern in _CODE_WRITE)
 
 
+def _mask_quoted(command: str) -> str:
+    out: list[str] = []
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if ch in {"'", '"'}:
+            quote = ch
+            out.append(" ")
+            i += 1
+            while i < n:
+                if quote == '"' and command[i] == "\\" and i + 1 < n:
+                    out.append(" ")
+                    out.append(" ")
+                    i += 2
+                    continue
+                if command[i] == quote:
+                    out.append(" ")
+                    i += 1
+                    break
+                out.append(" ")
+                i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _redirect_destinations(masked: str) -> list[str | None]:
+    destinations: list[str | None] = []
+    i = 0
+    length = len(masked)
+    while i < length:
+        if masked[i] != ">":
+            i += 1
+            continue
+        end = i + 2 if i + 1 < length and masked[i + 1] == ">" else i + 1
+        prev = masked[i - 1] if i else ""
+        nxt = masked[end] if end < length else ""
+        if prev in "-=~" or nxt in "&=":
+            i = end
+            continue
+        rest = masked[end:].lstrip()
+        if not rest:
+            destinations.append(None)
+        else:
+            token = rest.split(None, 1)[0]
+            destinations.append(token)
+        i = end
+    return destinations
+
+
 def _terminal_mutates(command: str, root: Path, workdir: str | None) -> bool:
-    if _REDIRECT.search(command) or _GLUED_REDIRECT.search(command):
-        return True
+    masked = _mask_quoted(command)
+    for dest in _redirect_destinations(masked):
+        if dest is None:
+            return True
+        if dest.startswith("&"):
+            continue
+        if dest in {"/dev/null", "/dev/zero", "/dev/stderr", "/dev/stdout"}:
+            continue
+        if _target_in_workspace_or_unknown(dest, root, workdir):
+            return True
     if re.search(r"\btee\b", command) or re.search(r"\btruncate\b", command):
         return True
     if re.search(r"\bgit\s+apply\b", command):
@@ -1026,11 +1212,16 @@ def _mutating_tokens(chunk: str, root: Path, workdir: str | None) -> bool:
         if not targets:
             return True
         return any(_target_in_workspace_or_unknown(token, root, workdir) for token in targets)
-    if name in {"mv", "cp"}:
+    if name == "mv":
         targets = [token for token in tokens[1:] if not token.startswith("-")]
         if len(targets) < 2:
             return True
         return any(_target_in_workspace_or_unknown(token, root, workdir) for token in targets)
+    if name == "cp":
+        targets = [token for token in tokens[1:] if not token.startswith("-")]
+        if len(targets) < 2:
+            return True
+        return _target_in_workspace_or_unknown(targets[-1], root, workdir)
     return False
 
 

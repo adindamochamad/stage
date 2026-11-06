@@ -132,6 +132,8 @@ class ReviewTest(unittest.TestCase):
         rewritten = directive["args"]["patch"]
         self.assertIn(str(self.storage), rewritten)
         self.assertEqual(self.note.read_text(encoding="utf-8"), "OLD\n")
+        self.assertEqual(engine.stage_status("task", storage=self.storage)["pending"], [])
+        engine.commit_v4a_batch("task", storage=self.storage)
         status = engine.stage_status("task", storage=self.storage)
         self.assertEqual(status["pending"][0]["path"], "note.txt")
         scratch_path = Path(
@@ -176,6 +178,92 @@ class ReviewTest(unittest.TestCase):
         self.assertFalse(self.note.exists())
         self.assertIsNone(applied["receipts"][0]["after_sha256"])
 
+    def test_v4a_mixed_delete_is_not_applyable_until_commit(self):
+        gone = self.workspace / "gone.txt"
+        gone.write_text("BYE\n", encoding="utf-8")
+        patch = (
+            "*** Begin Patch\n"
+            "*** Delete File: gone.txt\n"
+            "*** Update File: note.txt\n"
+            "@@\n"
+            "-OLD\n"
+            "+NEW\n"
+            "*** End Patch\n"
+        )
+        directive = engine.plan_tool(
+            "patch",
+            {"mode": "patch", "patch": patch},
+            "task",
+            workspace=self.workspace,
+            storage=self.storage,
+        )
+        self.assertEqual(directive["action"], "modify")
+        self.assertTrue(gone.is_file())
+        self.assertEqual(gone.read_text(encoding="utf-8"), "BYE\n")
+        self.assertEqual(engine.stage_status("task", storage=self.storage)["pending"], [])
+        applied = engine.stage_apply("task", workspace=self.workspace, storage=self.storage)
+        self.assertEqual(applied["applied"], [])
+        self.assertTrue(gone.is_file())
+        self.assertEqual(self.note.read_text(encoding="utf-8"), "OLD\n")
+
+    def test_v4a_mixed_drop_removes_uncommitted_batch(self):
+        gone = self.workspace / "gone.txt"
+        gone.write_text("BYE\n", encoding="utf-8")
+        patch = (
+            "*** Begin Patch\n"
+            "*** Delete File: gone.txt\n"
+            "*** Update File: note.txt\n"
+            "@@\n"
+            "-OLD\n"
+            "+NEW\n"
+            "*** End Patch\n"
+        )
+        engine.plan_tool(
+            "patch",
+            {"mode": "patch", "patch": patch},
+            "task",
+            workspace=self.workspace,
+            storage=self.storage,
+        )
+        dropped = engine.drop_v4a_batch("task", storage=self.storage)
+        self.assertIn("gone.txt", dropped["dropped"])
+        self.assertIn("note.txt", dropped["dropped"])
+        self.assertTrue(gone.is_file())
+        self.assertEqual(gone.read_text(encoding="utf-8"), "BYE\n")
+        self.assertEqual(engine.stage_status("task", storage=self.storage)["pending"], [])
+        applied = engine.stage_apply("task", workspace=self.workspace, storage=self.storage)
+        self.assertEqual(applied["applied"], [])
+        self.assertTrue(gone.is_file())
+
+    def test_v4a_mixed_commit_then_apply_deletes(self):
+        gone = self.workspace / "gone.txt"
+        gone.write_text("BYE\n", encoding="utf-8")
+        patch = (
+            "*** Begin Patch\n"
+            "*** Delete File: gone.txt\n"
+            "*** Update File: note.txt\n"
+            "@@\n"
+            "-OLD\n"
+            "+NEW\n"
+            "*** End Patch\n"
+        )
+        engine.plan_tool(
+            "patch",
+            {"mode": "patch", "patch": patch},
+            "task",
+            workspace=self.workspace,
+            storage=self.storage,
+        )
+        scratch = Path(
+            engine._load(engine._journal_path(self.storage, "task"))["files"]["note.txt"]["scratch"]
+        )
+        scratch.write_text("NEW\n", encoding="utf-8")
+        engine.commit_v4a_batch("task", storage=self.storage)
+        applied = engine.stage_apply("task", workspace=self.workspace, storage=self.storage)
+        self.assertEqual(sorted(applied["applied"]), ["gone.txt", "note.txt"])
+        self.assertFalse(gone.exists())
+        self.assertEqual(self.note.read_text(encoding="utf-8"), "NEW\n")
+
     def test_v4a_outside_workspace_blocks_the_whole_call(self):
         patch = (
             "*** Begin Patch\n"
@@ -200,6 +288,9 @@ class ReviewTest(unittest.TestCase):
             "git diff",
             "python3 tests/test_engine.py",
             "pytest",
+            "grep 'a>b' README.md",
+            "ls >/dev/null",
+            "cp note.txt /tmp/backup",
         ]
         blocked = [
             "sed -i s/a/b/ note.txt",
@@ -209,10 +300,13 @@ class ReviewTest(unittest.TestCase):
             "echo hi > note.txt",
             "echo hi >> note.txt",
             "echo NEW>note.txt",
+            "echo NEW> note.txt",
+            'echo NEW>"note.txt"',
             "rm note.txt",
             "mv note.txt gone.txt",
             "mv note.txt /tmp/x",
             "cp note.txt copy.txt",
+            "cp /tmp/x note.txt",
             "git apply changes.patch",
             "git checkout note.txt",
             "git restore note.txt",

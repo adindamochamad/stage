@@ -39,12 +39,12 @@ Hermes writes scratch copies. Both files on disk still have the old lines. Then:
 2. **`patch` on a file that is not there.** The call is blocked. Nothing is created and nothing else changes.
 3. **`stage_apply` when nothing is staged.** The tool returns an empty `applied` list. Files on disk stay as they are.
 4. **`stage_apply` after the original changed.** The apply for that file is refused. The newer bytes stay, and the scratch copy stays pending. Call `stage_diff` for that path, then `stage_discard` on that path. Staging the same path again does not refresh the protected hash.
-5. **Shell or `execute_code` that would change a workspace file.** The plugin blocks common shell patterns (`sed -i`, redirects, `rm`/`mv`/`cp` touching the workspace, and similar). Use `write_file` or `patch`, then `stage_apply`.
+5. **Shell or `execute_code` that would change a workspace file.** The plugin blocks common shell patterns (`sed -i`, redirects into the workspace, `rm`/`mv` touching the workspace, `cp` whose destination is in the workspace). Use `write_file` or `patch`, then `stage_apply`.
 
 ## Known limits
 
 - MCP tools are not staged.
-- File deletion is staged only for V4A `Delete File` hunks. Other delete tools still change disk.
+- File deletion is staged only for V4A `Delete File` hunks. Other delete tools still change disk. A mixed V4A patch (delete plus add/update) is committed only after the Hermes patch succeeds; if that patch fails, the delete is dropped and `stage_apply` will not remove the file.
 - `read_file` reads the original file, not the scratch copy.
 - A scratch journal written by 0.1.0 has no hash, so apply refuses it. Call `stage_discard` before a demo.
 - Shell commands that hide a write (`python -c`, `dd`) are not all caught.
